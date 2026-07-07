@@ -455,6 +455,63 @@ export class AzureDevOpsClient {
     }));
   }
 
+  async addWorkItemComment(workItemId: number, text: string): Promise<{ id: number; text: string; createdBy: string; createdDate: string }> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}/comments?api-version=7.0-preview.4`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify({ text }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Azure DevOps API error (${response.status}): ${errorBody}`);
+    }
+
+    const result = (await response.json()) as any;
+    return {
+      id: result.id,
+      text: result.text || '',
+      createdBy: result.createdBy?.displayName || 'Unknown',
+      createdDate: result.createdDate || '',
+    };
+  }
+
+  async updateWorkItemComment(workItemId: number, commentId: number, text: string): Promise<{ id: number; text: string; modifiedBy: string; modifiedDate: string }> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}/comments/${commentId}?api-version=7.0-preview.4`;
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: this.headers,
+      body: JSON.stringify({ text }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Azure DevOps API error (${response.status}): ${errorBody}`);
+    }
+
+    const result = (await response.json()) as any;
+    return {
+      id: result.id,
+      text: result.text || '',
+      modifiedBy: result.modifiedBy?.displayName || 'Unknown',
+      modifiedDate: result.modifiedDate || '',
+    };
+  }
+
+  async deleteWorkItemComment(workItemId: number, commentId: number): Promise<void> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}/comments/${commentId}?api-version=7.0-preview.4`;
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: this.headers,
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Azure DevOps API error (${response.status}): ${errorBody}`);
+    }
+  }
+
   async getPipelines(): Promise<{ id: number; name: string; folder: string; url: string }[]> {
     const url = `${this.projectUrl}/_apis/pipelines?api-version=7.0`;
     const result = await this.request<{ value: any[] }>(url);
@@ -562,6 +619,116 @@ export class AzureDevOpsClient {
         finishTime: r.finishTime,
         sourceBranch: r.sourceBranch,
       })),
+    };
+  }
+
+  async getWorkItemFields(workItemId: number): Promise<{ name: string; referenceName: string; value: any }[]> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?$expand=all&api-version=7.0`;
+    const result = await this.request<any>(url);
+
+    const fields = result.fields || {};
+    return Object.entries(fields).map(([referenceName, value]) => {
+      const name = referenceName.split('.').pop() || referenceName;
+      return { name, referenceName, value };
+    });
+  }
+
+  async checkWorkItemExists(workItemId: number): Promise<{
+    exists: boolean;
+    id?: number;
+    title?: string;
+    state?: string;
+    workItemType?: string;
+    assignedTo?: string;
+    createdDate?: string;
+    changedDate?: string;
+    areaPath?: string;
+    iterationPath?: string;
+    url?: string;
+  }> {
+    try {
+      const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?api-version=7.0`;
+      const result = await this.request<any>(url);
+
+      const fields = result.fields || {};
+      return {
+        exists: true,
+        id: result.id,
+        title: fields['System.Title'] || '',
+        state: fields['System.State'] || '',
+        workItemType: fields['System.WorkItemType'] || '',
+        assignedTo: fields['System.AssignedTo']?.displayName || 'Unassigned',
+        createdDate: fields['System.CreatedDate'] || '',
+        changedDate: fields['System.ChangedDate'] || '',
+        areaPath: fields['System.AreaPath'] || '',
+        iterationPath: fields['System.IterationPath'] || '',
+        url: `${this.config.orgUrl}/${this.config.project}/_workitems/edit/${result.id}`,
+      };
+    } catch (error: any) {
+      if (error.message?.includes('404') || error.message?.includes('does not exist')) {
+        return { exists: false };
+      }
+      throw error;
+    }
+  }
+
+  async updateWorkItemFields(
+    workItemId: number,
+    fields: { referenceName: string; value: any }[]
+  ): Promise<{ id: number; title: string; url: string; previousFields: Record<string, any>; actualFields: Record<string, any> }> {
+    // Fetch current field values before the update
+    const preUrl = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?$expand=all&api-version=7.0`;
+    const preResponse = await fetch(preUrl, { method: 'GET', headers: this.headers });
+    let previousFields: Record<string, any> = {};
+    if (preResponse.ok) {
+      const preResult = (await preResponse.json()) as any;
+      previousFields = preResult.fields || {};
+    }
+
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?api-version=7.0`;
+
+    const patchDocument = fields.map((f) => ({
+      op: 'add',
+      path: `/fields/${f.referenceName}`,
+      value: f.value,
+    }));
+
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        ...this.headers,
+        'Content-Type': 'application/json-patch+json',
+      },
+      body: JSON.stringify(patchDocument),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Azure DevOps API error (${response.status}): ${errorBody}`);
+    }
+
+    const patchResult = (await response.json()) as any;
+    const workItemIdFromPatch = patchResult.id;
+
+    // Do a fresh GET after the PATCH to read the truly persisted values
+    // (PATCH response may echo back requested values for locked/read-only fields)
+    const postUrl = `${this.projectUrl}/_apis/wit/workitems/${workItemIdFromPatch}?$expand=all&api-version=7.0`;
+    const postResponse = await fetch(postUrl, { method: 'GET', headers: this.headers });
+    let actualFields: Record<string, any> = {};
+    if (postResponse.ok) {
+      const postResult = (await postResponse.json()) as any;
+      actualFields = postResult.fields || {};
+    } else {
+      // Fallback to PATCH response if GET fails
+      actualFields = patchResult.fields || {};
+    }
+
+    return {
+      id: workItemIdFromPatch,
+      title: actualFields['System.Title'] || patchResult.fields?.['System.Title'] || '',
+      url: `${this.config.orgUrl}/${this.config.project}/_workitems/edit/${workItemIdFromPatch}`,
+      previousFields,
+      actualFields,
     };
   }
 }

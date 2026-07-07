@@ -606,7 +606,7 @@ server.tool(
       let text = `**Comments on Work Item #${workItemId}** (${comments.length} total):\n\n`;
       for (const comment of comments) {
         const date = comment.createdDate ? new Date(comment.createdDate).toLocaleString() : 'N/A';
-        text += `---\n**${comment.createdBy}** — ${date}\n\n${comment.text}\n\n`;
+        text += `---\n**Comment ID: ${comment.id}** | **${comment.createdBy}** — ${date}\n\n${comment.text}\n\n`;
       }
 
       return {
@@ -751,6 +751,348 @@ server.tool(
     } catch (error: any) {
       return {
         content: [{ type: 'text' as const, text: `Error fetching pipeline health: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Work Item Fields
+server.tool(
+  'get_work_item_fields',
+  'Get all fields and their values for a given work item. Returns every field reference name and its current value.',
+  {
+    workItemId: z.number().describe('The ID of the work item to get fields for'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const fields = await client.getWorkItemFields(workItemId);
+
+      if (fields.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No fields found for work item #${workItemId}.` }],
+        };
+      }
+
+      let text = `**All Fields for Work Item #${workItemId}** (${fields.length} fields):\n\n`;
+      text += '| Field Name | Reference Name | Value |\n';
+      text += '|------------|----------------|-------|\n';
+      for (const field of fields) {
+        let displayValue = field.value;
+        if (displayValue === null || displayValue === undefined) {
+          displayValue = '';
+        } else if (typeof displayValue === 'object') {
+          displayValue = displayValue.displayName || displayValue.name || JSON.stringify(displayValue);
+        }
+        const escaped = String(displayValue).replace(/\|/g, '\\|').replace(/\n/g, ' ');
+        text += `| ${field.name} | ${field.referenceName} | ${escaped} |\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching work item fields: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Check Work Item Exists
+server.tool(
+  'check_work_item',
+  'Check if a work item exists by ID. If it exists, returns basic information (title, type, state, assigned to, dates) along with a direct link to the work item.',
+  {
+    workItemId: z.number().describe('The ID of the work item to check'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const result = await client.checkWorkItemExists(workItemId);
+
+      if (!result.exists) {
+        return {
+          content: [{ type: 'text' as const, text: `❌ Work item #${workItemId} does **not exist** or has been deleted.` }],
+        };
+      }
+
+      let text = `✅ **Work Item #${result.id} exists**\n\n`;
+      text += `| Field | Value |\n`;
+      text += `|-------|-------|\n`;
+      text += `| **Title** | ${result.title} |\n`;
+      text += `| **Type** | ${result.workItemType} |\n`;
+      text += `| **State** | ${result.state} |\n`;
+      text += `| **Assigned To** | ${result.assignedTo} |\n`;
+      text += `| **Area Path** | ${result.areaPath} |\n`;
+      text += `| **Iteration Path** | ${result.iterationPath} |\n`;
+      text += `| **Created** | ${result.createdDate ? new Date(result.createdDate).toLocaleString() : 'N/A'} |\n`;
+      text += `| **Last Updated** | ${result.changedDate ? new Date(result.changedDate).toLocaleString() : 'N/A'} |\n`;
+      text += `\n🔗 **Link:** [Open Work Item #${result.id}](${result.url})\n`;
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error checking work item: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Update Work Item Fields
+server.tool(
+  'update_work_item',
+  `Update one or more fields on a work item. Supports all standard fields including title, description, state, assigned to, effort/story points, priority, area path, iteration path, tags, and any custom fields.
+
+Common field reference names:
+- System.Title
+- System.Description
+- System.State (New, Active, Resolved, Closed)
+- System.AssignedTo (use display name or email)
+- System.AreaPath
+- System.IterationPath
+- System.Tags (semicolon-separated)
+- Microsoft.VSTS.Common.Priority (1-4)
+- Microsoft.VSTS.Scheduling.StoryPoints
+- Microsoft.VSTS.Scheduling.Effort
+- Microsoft.VSTS.Scheduling.RemainingWork
+- Microsoft.VSTS.Scheduling.CompletedWork
+- Microsoft.VSTS.Scheduling.OriginalEstimate
+- Microsoft.VSTS.Common.ValueArea
+- Microsoft.VSTS.Common.Risk
+- Microsoft.VSTS.Common.Severity
+
+Note: Does NOT update comments — use a separate tool for that.`,
+  {
+    workItemId: z.number().describe('The ID of the work item to update'),
+    fields: z.array(
+      z.object({
+        referenceName: z.string().describe('The field reference name, e.g. System.Title, Microsoft.VSTS.Scheduling.StoryPoints'),
+        value: z.union([z.string(), z.number(), z.null()]).describe('The new value for the field. Use null to clear a field.'),
+      })
+    ).describe('Array of fields to update with their new values'),
+  },
+  async ({ workItemId, fields }) => {
+    try {
+      const result = await client.updateWorkItemFields(workItemId, fields);
+
+      const succeeded: { ref: string; requested: any; actual: any }[] = [];
+      const unchanged: { ref: string; requested: any; reason: string }[] = [];
+      const failed: { ref: string; requested: any; actual: any; reason: string }[] = [];
+
+      const normalizeValue = (val: any): string => {
+        if (val === null || val === undefined) return '';
+        if (typeof val === 'object') return (val.displayName || val.name || JSON.stringify(val)).toString().trim().toLowerCase();
+        return String(val).trim().toLowerCase();
+      };
+
+      for (const field of fields) {
+        const actualValue = result.actualFields[field.referenceName];
+        const previousValue = result.previousFields[field.referenceName];
+        const requested = field.value;
+
+        const actualNorm = normalizeValue(actualValue);
+        const previousNorm = normalizeValue(previousValue);
+        const requestedNorm = normalizeValue(requested);
+
+        // Check if the actual value matches the requested value
+        let matchesRequested = false;
+        if (requested === null) {
+          matchesRequested = actualNorm === '' || actualValue === null || actualValue === undefined || actualValue === 0;
+        } else if (typeof requested === 'number') {
+          matchesRequested = Number(actualNorm) === requested || actualNorm === requestedNorm;
+        } else if (field.referenceName === 'System.Description' || field.referenceName === 'System.History') {
+          matchesRequested = actualNorm.includes(requestedNorm) || actualNorm.replace(/<[^>]*>/g, '').includes(requestedNorm);
+        } else {
+          matchesRequested = actualNorm === requestedNorm || actualNorm.includes(requestedNorm);
+        }
+
+        // Check if the value actually changed from before
+        let valueChanged = previousNorm !== actualNorm;
+        // Check if the previous value already matched what was requested
+        let previousMatchedRequested = false;
+        if (requested === null) {
+          previousMatchedRequested = previousNorm === '' || previousValue === null || previousValue === undefined || previousValue === 0;
+        } else if (typeof requested === 'number') {
+          previousMatchedRequested = Number(previousNorm) === requested || previousNorm === requestedNorm;
+        } else if (field.referenceName === 'System.Description' || field.referenceName === 'System.History') {
+          previousMatchedRequested = previousNorm.includes(requestedNorm) || previousNorm.replace(/<[^>]*>/g, '').includes(requestedNorm);
+        } else {
+          previousMatchedRequested = previousNorm === requestedNorm || previousNorm.includes(requestedNorm);
+        }
+
+        if (matchesRequested && valueChanged) {
+          // Value changed to what we requested — genuine success
+          succeeded.push({ ref: field.referenceName, requested, actual: actualValue });
+        } else if (matchesRequested && !valueChanged && previousMatchedRequested) {
+          // Before == After == Requested — field already had this value, no change was needed
+          unchanged.push({
+            ref: field.referenceName,
+            requested,
+            reason: 'Field already had this value — no change was needed',
+          });
+        } else if (!matchesRequested && !valueChanged) {
+          // Before == After != Requested — update was rejected (field is locked/read-only)
+          const actualDisplay = actualValue === undefined || actualValue === null || actualValue === ''
+            ? '(empty)' : (typeof actualValue === 'object' ? normalizeValue(actualValue) : actualValue);
+          failed.push({
+            ref: field.referenceName,
+            requested,
+            actual: actualDisplay,
+            reason: 'Update rejected — field is likely locked or read-only',
+          });
+        } else if (!matchesRequested && valueChanged) {
+          // Value changed but not to what we requested
+          failed.push({
+            ref: field.referenceName,
+            requested,
+            actual: actualValue === undefined ? '(empty)' : (typeof actualValue === 'object' ? normalizeValue(actualValue) : actualValue),
+            reason: actualValue === undefined
+              ? 'Field not found in response — may be an invalid field name'
+              : 'Value changed but does not match the requested value',
+          });
+        } else {
+          // matchesRequested && !valueChanged && !previousMatchedRequested
+          // Edge case: actual matches requested but value didn't change and previous didn't match
+          // This shouldn't normally happen, but treat as suspicious
+          failed.push({
+            ref: field.referenceName,
+            requested,
+            actual: actualValue === undefined ? '(empty)' : (typeof actualValue === 'object' ? normalizeValue(actualValue) : actualValue),
+            reason: 'Unexpected state — field may be locked or read-only',
+          });
+        }
+      }
+
+      let text = '';
+
+      if (failed.length === 0 && unchanged.length === 0) {
+        text += `✅ **Work Item #${result.id} — All ${fields.length} field(s) updated and verified successfully**\n\n`;
+      } else if (failed.length === 0 && succeeded.length === 0) {
+        text += `⚠️ **Work Item #${result.id} — No fields were actually changed**\n\n`;
+      } else {
+        text += `⚠️ **Work Item #${result.id} — ${succeeded.length} updated, ${unchanged.length} unchanged, ${failed.length} failed (out of ${fields.length})**\n\n`;
+      }
+
+      text += `**Title:** ${result.title}\n\n`;
+
+      if (succeeded.length > 0) {
+        text += `### ✅ Successfully Updated\n`;
+        for (const s of succeeded) {
+          const displayValue = s.requested === null ? '(cleared)' : String(s.requested);
+          text += `- \`${s.ref}\` → ${displayValue}\n`;
+        }
+        text += `\n`;
+      }
+
+      if (unchanged.length > 0) {
+        text += `### ⚠️ Unchanged\n`;
+        text += `| Field | Requested Value | Reason |\n`;
+        text += `|-------|----------------|--------|\n`;
+        for (const u of unchanged) {
+          const reqDisplay = u.requested === null ? '(clear)' : String(u.requested);
+          text += `| \`${u.ref}\` | ${reqDisplay} | ${u.reason} |\n`;
+        }
+        text += `\n`;
+      }
+
+      if (failed.length > 0) {
+        text += `### ❌ Failed Updates\n`;
+        text += `| Field | Requested Value | Actual Value | Reason |\n`;
+        text += `|-------|----------------|--------------|--------|\n`;
+        for (const f of failed) {
+          const reqDisplay = f.requested === null ? '(clear)' : String(f.requested);
+          text += `| \`${f.ref}\` | ${reqDisplay} | ${f.actual} | ${f.reason} |\n`;
+        }
+        text += `\n`;
+      }
+
+      text += `🔗 [Open Work Item #${result.id}](${result.url})`;
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error updating work item: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Manage Work Item Comment (Add / Update / Delete)
+server.tool(
+  'manage_work_item_comment',
+  'Add, update, or delete a comment on a work item. Use action "add" to create a new comment, "update" to edit an existing comment (requires commentId), or "delete" to remove a comment (requires commentId). Use get_work_item_comments first to find comment IDs.',
+  {
+    workItemId: z.number().describe('The ID of the work item'),
+    action: z.enum(['add', 'update', 'delete']).describe('The action to perform: add, update, or delete'),
+    text: z.string().optional().describe('The comment text (required for add and update)'),
+    commentId: z.number().optional().describe('The comment ID (required for update and delete). Use get_work_item_comments to find it.'),
+  },
+  async ({ workItemId, action, text, commentId }) => {
+    try {
+      if (action === 'add') {
+        if (!text) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: "text" is required to add a comment.' }],
+            isError: true,
+          };
+        }
+        const comment = await client.addWorkItemComment(workItemId, text);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `✅ **Comment added to Work Item #${workItemId}**\n\n**Comment ID:** ${comment.id}\n**By:** ${comment.createdBy}\n**Date:** ${new Date(comment.createdDate).toLocaleString()}\n\n**Text:**\n${comment.text}\n\n🔗 [Open Work Item #${workItemId}](https://dev.azure.com/SHS-CT-ProcessTooling/PLM/_workitems/edit/${workItemId})`,
+          }],
+        };
+      } else if (action === 'update') {
+        if (!commentId) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: "commentId" is required to update a comment. Use get_work_item_comments to find comment IDs.' }],
+            isError: true,
+          };
+        }
+        if (!text) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: "text" is required to update a comment.' }],
+            isError: true,
+          };
+        }
+        const updated = await client.updateWorkItemComment(workItemId, commentId, text);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `✅ **Comment #${updated.id} updated on Work Item #${workItemId}**\n\n**Modified by:** ${updated.modifiedBy}\n**Date:** ${new Date(updated.modifiedDate).toLocaleString()}\n\n**New text:**\n${updated.text}\n\n🔗 [Open Work Item #${workItemId}](https://dev.azure.com/SHS-CT-ProcessTooling/PLM/_workitems/edit/${workItemId})`,
+          }],
+        };
+      } else if (action === 'delete') {
+        if (!commentId) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: "commentId" is required to delete a comment. Use get_work_item_comments to find comment IDs.' }],
+            isError: true,
+          };
+        }
+        await client.deleteWorkItemComment(workItemId, commentId);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `✅ **Comment #${commentId} deleted from Work Item #${workItemId}**\n\n🔗 [Open Work Item #${workItemId}](https://dev.azure.com/SHS-CT-ProcessTooling/PLM/_workitems/edit/${workItemId})`,
+          }],
+        };
+      }
+
+      return {
+        content: [{ type: 'text' as const, text: `Error: Unknown action "${action}". Use "add", "update", or "delete".` }],
+        isError: true,
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error managing comment: ${error.message}` }],
         isError: true,
       };
     }

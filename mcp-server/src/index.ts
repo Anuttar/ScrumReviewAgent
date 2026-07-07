@@ -375,6 +375,49 @@ server.tool(
   }
 );
 
+// Tool: Link Work Items
+server.tool(
+  'link_work_items',
+  'Add a link between two work items in Azure DevOps. Supports different link types like Related, Parent/Child, Predecessor/Successor.',
+  {
+    sourceWorkItemId: z.number().describe('The ID of the source work item to add the link FROM'),
+    targetWorkItemId: z.number().describe('The ID of the target work item to link TO'),
+    linkType: z.enum([
+      'System.LinkTypes.Related',
+      'System.LinkTypes.Hierarchy-Forward',
+      'System.LinkTypes.Hierarchy-Reverse',
+      'System.LinkTypes.Dependency-Forward',
+      'System.LinkTypes.Dependency-Reverse',
+    ]).optional().describe(
+      'Type of link: Related (default), Hierarchy-Forward (Parent→Child), Hierarchy-Reverse (Child→Parent), Dependency-Forward (Predecessor→Successor), Dependency-Reverse (Successor→Predecessor)'
+    ),
+    comment: z.string().optional().describe('Optional comment describing why the items are linked'),
+  },
+  async ({ sourceWorkItemId, targetWorkItemId, linkType, comment }) => {
+    try {
+      const result = await client.addWorkItemLink(
+        sourceWorkItemId,
+        targetWorkItemId,
+        linkType || 'System.LinkTypes.Related',
+        comment
+      );
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `✅ Link added successfully!\n\nSource: Work Item #${sourceWorkItemId}\nTarget: Work Item #${targetWorkItemId} (${result.title})\nLink Type: ${linkType || 'Related'}${comment ? `\nComment: ${comment}` : ''}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Start the server
 async function main() {
   const transport = new StdioServerTransport();

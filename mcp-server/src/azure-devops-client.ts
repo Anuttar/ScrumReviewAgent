@@ -221,4 +221,47 @@ export class AzureDevOpsClient {
     const ids = result.workItems.map(wi => wi.id);
     return this.getWorkItemDetails(ids);
   }
+
+  async addWorkItemLink(
+    sourceId: number,
+    targetId: number,
+    linkType: string = 'System.LinkTypes.Related',
+    comment?: string
+  ): Promise<{ id: number; title: string }> {
+    const targetUrl = `${this.projectUrl}/_apis/wit/workitems/${targetId}`;
+    const patchDocument: any[] = [
+      {
+        op: 'add',
+        path: '/relations/-',
+        value: {
+          rel: linkType,
+          url: targetUrl,
+          attributes: {
+            comment: comment || '',
+          },
+        },
+      },
+    ];
+
+    const url = `${this.projectUrl}/_apis/wit/workitems/${sourceId}?api-version=7.0`;
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        ...this.headers,
+        'Content-Type': 'application/json-patch+json',
+      },
+      body: JSON.stringify(patchDocument),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to add link (${response.status}): ${errorText}`);
+    }
+
+    const result = await response.json() as any;
+    return {
+      id: result.id,
+      title: result.fields?.['System.Title'] || '',
+    };
+  }
 }

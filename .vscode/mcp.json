@@ -1,0 +1,38 @@
+{
+  "servers": {
+    "azuredevops": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp-server/dist/index.js"],
+      "env": {
+        "AZURE_DEVOPS_ORG_URL": "${input:azureDevOpsOrgUrl}",
+        "AZURE_DEVOPS_PROJECT": "${input:azureDevOpsProject}",
+        "AZURE_DEVOPS_TEAM": "${input:azureDevOpsTeam}",
+        "AZURE_DEVOPS_PAT": "${input:azureDevOpsPat}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "azureDevOpsOrgUrl",
+      "type": "promptString",
+      "description": "Azure DevOps Organization URL (e.g., https://dev.azure.com/yourorg)"
+    },
+    {
+      "id": "azureDevOpsProject",
+      "type": "promptString",
+      "description": "Azure DevOps Project Name"
+    },
+    {
+      "id": "azureDevOpsTeam",
+      "type": "promptString",
+      "description": "Azure DevOps Team Name"
+    },
+    {
+      "id": "azureDevOpsPat",
+      "type": "promptString",
+      "description": "Azure DevOps Personal Access Token (PAT)",
+      "password": true
+    }
+  ]
+}

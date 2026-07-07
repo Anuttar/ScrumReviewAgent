@@ -425,4 +425,33 @@ export class AzureDevOpsClient {
       };
     }
   }
+
+  async getWorkItemChildren(workItemId: number): Promise<WorkItem[]> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?$expand=relations&api-version=7.0`;
+    const response = await this.request<any>(url);
+
+    const relations = response.relations || [];
+    const childIds = relations
+      .filter((r: any) => r.rel === 'System.LinkTypes.Hierarchy-Forward')
+      .map((r: any) => {
+        const parts = r.url.split('/');
+        return parseInt(parts[parts.length - 1], 10);
+      })
+      .filter((id: number) => !isNaN(id));
+
+    if (childIds.length === 0) return [];
+    return this.getWorkItemDetails(childIds);
+  }
+
+  async getWorkItemComments(workItemId: number): Promise<{ id: number; text: string; createdBy: string; createdDate: string }[]> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}/comments?api-version=7.0-preview.4`;
+    const result = await this.request<{ comments: any[] }>(url);
+
+    return (result.comments || []).map((c: any) => ({
+      id: c.id,
+      text: c.text || '',
+      createdBy: c.createdBy?.displayName || 'Unknown',
+      createdDate: c.createdDate || '',
+    }));
+  }
 }

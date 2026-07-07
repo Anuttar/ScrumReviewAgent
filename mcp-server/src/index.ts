@@ -550,6 +550,77 @@ server.tool(
   }
 );
 
+// Tool: Get Work Item Children
+server.tool(
+  'get_work_item_children',
+  'Get all child work items of a given work item. Returns details of each child including ID, title, type, state, and assigned to.',
+  {
+    workItemId: z.number().describe('The ID of the parent work item'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const children = await client.getWorkItemChildren(workItemId);
+
+      if (children.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No child work items found for #${workItemId}.` }],
+        };
+      }
+
+      let text = `**Child Work Items of #${workItemId}** (${children.length} total):\n\n`;
+      text += '| ID | Type | Title | State | Assigned To | Story Points |\n';
+      text += '|----|------|-------|-------|-------------|-------------|\n';
+      for (const child of children) {
+        text += `| #${child.id} | ${child.workItemType} | ${child.title} | ${child.state} | ${child.assignedTo} | ${child.storyPoints ?? '-'} |\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching children: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Work Item Comments
+server.tool(
+  'get_work_item_comments',
+  'Get all comments/discussion from a work item. Returns each comment with author and date.',
+  {
+    workItemId: z.number().describe('The ID of the work item to get comments for'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const comments = await client.getWorkItemComments(workItemId);
+
+      if (comments.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No comments found on work item #${workItemId}.` }],
+        };
+      }
+
+      let text = `**Comments on Work Item #${workItemId}** (${comments.length} total):\n\n`;
+      for (const comment of comments) {
+        const date = comment.createdDate ? new Date(comment.createdDate).toLocaleString() : 'N/A';
+        text += `---\n**${comment.createdBy}** — ${date}\n\n${comment.text}\n\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching comments: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Start the server
 async function main() {
   const transport = new StdioServerTransport();

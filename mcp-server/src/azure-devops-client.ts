@@ -1,4 +1,5 @@
 import fetch from 'node-fetch';
+import { PDFParse } from 'pdf-parse';
 
 export interface AzureDevOpsConfig {
   orgUrl: string;        // e.g., "https://dev.azure.com/yourorg" or "http://your-server:8080/tfs/collection"
@@ -263,5 +264,165 @@ export class AzureDevOpsClient {
       id: result.id,
       title: result.fields?.['System.Title'] || '',
     };
+  }
+
+  async createWorkItem(
+    workItemType: string,
+    title: string,
+    options?: {
+      description?: string;
+      assignedTo?: string;
+      iterationPath?: string;
+      areaPath?: string;
+      state?: string;
+      storyPoints?: number;
+      tags?: string;
+      parentId?: number;
+    }
+  ): Promise<{ id: number; title: string; url: string }> {
+    const patchDocument: any[] = [
+      { op: 'add', path: '/fields/System.Title', value: title },
+    ];
+
+    if (options?.description) {
+      patchDocument.push({ op: 'add', path: '/fields/System.Description', value: options.description });
+    }
+    if (options?.assignedTo) {
+      patchDocument.push({ op: 'add', path: '/fields/System.AssignedTo', value: options.assignedTo });
+    }
+    if (options?.iterationPath) {
+      patchDocument.push({ op: 'add', path: '/fields/System.IterationPath', value: options.iterationPath });
+    }
+    if (options?.areaPath) {
+      patchDocument.push({ op: 'add', path: '/fields/System.AreaPath', value: options.areaPath });
+    }
+    if (options?.state) {
+      patchDocument.push({ op: 'add', path: '/fields/System.State', value: options.state });
+    }
+    if (options?.storyPoints !== undefined) {
+      patchDocument.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.StoryPoints', value: options.storyPoints });
+    }
+    if (options?.tags) {
+      patchDocument.push({ op: 'add', path: '/fields/System.Tags', value: options.tags });
+    }
+    if (options?.parentId) {
+      patchDocument.push({
+        op: 'add',
+        path: '/relations/-',
+        value: {
+          rel: 'System.LinkTypes.Hierarchy-Reverse',
+          url: `${this.projectUrl}/_apis/wit/workitems/${options.parentId}`,
+        },
+      });
+    }
+
+    const encodedType = encodeURIComponent(workItemType);
+    const url = `${this.projectUrl}/_apis/wit/workitems/$${encodedType}?api-version=7.0`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        ...this.headers,
+        'Content-Type': 'application/json-patch+json',
+      },
+      body: JSON.stringify(patchDocument),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to create work item (${response.status}): ${errorText}`);
+    }
+
+    const result = await response.json() as any;
+    const orgUrl = this.config.orgUrl;
+    const project = this.config.project;
+    const workItemUrl = `${orgUrl}/${project}/_workitems/edit/${result.id}`;
+
+    return {
+      id: result.id,
+      title: result.fields?.['System.Title'] || title,
+      url: workItemUrl,
+    };
+  }
+
+  async getWorkItemAttachments(
+    workItemId: number
+  ): Promise<{ id: string; name: string; url: string; size: number; createdDate: string }[]> {
+    const url = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?$expand=relations&api-version=7.0`;
+    const response = await this.request<any>(url);
+
+    const relations = response.relations || [];
+    return relations
+      .filter((r: any) => r.rel === 'AttachedFile')
+      .map((r: any) => {
+        const urlParts = r.url.split('/');
+        const attachmentId = urlParts[urlParts.length - 1].split('?')[0];
+        return {
+          id: attachmentId,
+          name: r.attributes?.name || 'unknown',
+          url: r.url,
+          size: r.attributes?.resourceSize || 0,
+          createdDate: r.attributes?.resourceCreatedDate || '',
+        };
+      });
+  }
+
+  async getAttachmentContent(attachmentId: string, fileName?: string): Promise<{ content: string; isText: boolean }> {
+    const url = `${this.config.orgUrl}/${this.config.project}/_apis/wit/attachments/${attachmentId}?api-version=7.0`;
+    const response = await fetch(url, {
+      headers: this.headers,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch attachment (${response.status}): ${errorText}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    const ext = fileName ? fileName.split('.').pop()?.toLowerCase() : '';
+    const textExtensions = [
+      'txt', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'ts', 'py', 'java',
+      'cs', 'css', 'scss', 'less', 'md', 'yaml', 'yml', 'toml', 'ini', 'cfg',
+      'conf', 'sh', 'bash', 'ps1', 'bat', 'cmd', 'sql', 'log', 'env',
+      'jsx', 'tsx', 'vue', 'svelte', 'rb', 'php', 'go', 'rs', 'kt', 'swift',
+      'c', 'cpp', 'h', 'hpp', 'r', 'scala', 'groovy', 'pl', 'pm',
+    ];
+    const isTextByExtension = ext ? textExtensions.includes(ext) : false;
+    const isTextByContentType = contentType.includes('text') ||
+      contentType.includes('json') ||
+      contentType.includes('xml') ||
+      contentType.includes('csv') ||
+      contentType.includes('html') ||
+      contentType.includes('javascript') ||
+      contentType.includes('yaml') ||
+      contentType.includes('markdown');
+    const isText = isTextByContentType || isTextByExtension;
+    const isPdf = ext === 'pdf' || contentType.includes('pdf');
+
+    if (isPdf) {
+      const buffer = await response.buffer();
+      try {
+        const parser = new PDFParse({ data: new Uint8Array(buffer) });
+        const textResult = await parser.getText();
+        await parser.destroy();
+        return {
+          content: textResult.text,
+          isText: true,
+        };
+      } catch (e: any) {
+        return {
+          content: `[PDF file, ${buffer.length} bytes — failed to extract text: ${e.message}]`,
+          isText: false,
+        };
+      }
+    } else if (isText) {
+      const text = await response.text();
+      return { content: text, isText: true };
+    } else {
+      const buffer = await response.buffer();
+      return {
+        content: `[Binary file, ${buffer.length} bytes, Content-Type: ${contentType}]`,
+        isText: false,
+      };
+    }
   }
 }

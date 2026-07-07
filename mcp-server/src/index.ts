@@ -418,6 +418,138 @@ server.tool(
   }
 );
 
+// Tool: Create Work Item
+server.tool(
+  'create_work_item',
+  'Create a new work item in Azure DevOps. Requires at minimum: work item type and title. Will prompt for other fields if not provided. Returns the link to the created work item.',
+  {
+    workItemType: z.enum(['User Story', 'Bug', 'Task', 'Feature', 'Epic', 'Product Backlog Item', 'Test Case'])
+      .describe('The type of work item to create'),
+    title: z.string().describe('Title of the work item'),
+    description: z.string().optional().describe('Detailed description of the work item (supports HTML)'),
+    assignedTo: z.string().optional().describe('Display name or email of the person to assign the work item to'),
+    iterationPath: z.string().optional()
+      .describe('Iteration path (e.g. "PLM\\PDS\\2026\\Avengers\\Q4\\Sprint 14"). If not provided, defaults to the project root iteration.'),
+    areaPath: z.string().optional().describe('Area path for the work item'),
+    state: z.string().optional().describe('Initial state (e.g. "New", "Active"). Defaults to "New".'),
+    storyPoints: z.number().optional().describe('Story points estimate (for User Stories/PBIs)'),
+    tags: z.string().optional().describe('Semicolon-separated tags (e.g. "Frontend; Bug; Sprint14")'),
+    parentId: z.number().optional().describe('ID of the parent work item to link this as a child of'),
+  },
+  async ({ workItemType, title, description, assignedTo, iterationPath, areaPath, state, storyPoints, tags, parentId }) => {
+    try {
+      const result = await client.createWorkItem(workItemType, title, {
+        description,
+        assignedTo,
+        iterationPath,
+        areaPath,
+        state,
+        storyPoints,
+        tags,
+        parentId,
+      });
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `✅ Work item created successfully!\n\n` +
+              `**ID:** #${result.id}\n` +
+              `**Type:** ${workItemType}\n` +
+              `**Title:** ${result.title}\n` +
+              (assignedTo ? `**Assigned To:** ${assignedTo}\n` : '') +
+              (iterationPath ? `**Iteration:** ${iterationPath}\n` : '') +
+              (storyPoints !== undefined ? `**Story Points:** ${storyPoints}\n` : '') +
+              (parentId ? `**Parent:** #${parentId}\n` : '') +
+              `\n**Link:** ${result.url}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error creating work item: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Work Item Attachments
+server.tool(
+  'get_work_item_attachments',
+  'List all attachments on a work item. Returns attachment names, sizes, and IDs that can be used with get_attachment_content to read file contents.',
+  {
+    workItemId: z.number().describe('The ID of the work item to get attachments for'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const attachments = await client.getWorkItemAttachments(workItemId);
+
+      if (attachments.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No attachments found on work item #${workItemId}.` }],
+        };
+      }
+
+      let text = `**Attachments on Work Item #${workItemId}** (${attachments.length} total):\n\n`;
+      text += '| # | Name | Size | Date | Attachment ID |\n';
+      text += '|---|------|------|------|---------------|\n';
+      attachments.forEach((a, i) => {
+        const sizeKB = (a.size / 1024).toFixed(1);
+        const date = a.createdDate ? new Date(a.createdDate).toLocaleDateString() : 'N/A';
+        text += `| ${i + 1} | ${a.name} | ${sizeKB} KB | ${date} | ${a.id} |\n`;
+      });
+      text += `\nTo read an attachment's content, use the **get_attachment_content** tool with the Attachment ID.`;
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching attachments: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Attachment Content
+server.tool(
+  'get_attachment_content',
+  'Read the content of a specific attachment from a work item. Use get_work_item_attachments first to get the attachment ID. Supports text-based files (txt, csv, json, xml, html, etc.). Binary files will return metadata only.',
+  {
+    attachmentId: z.string().describe('The attachment ID (GUID) from get_work_item_attachments'),
+    fileName: z.string().optional().describe('Optional: the file name for display purposes'),
+  },
+  async ({ attachmentId, fileName }) => {
+    try {
+      const result = await client.getAttachmentContent(attachmentId, fileName);
+      const displayName = fileName || attachmentId;
+
+      if (result.isText) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `**Content of: ${displayName}**\n\n\`\`\`\n${result.content}\n\`\`\``,
+          }],
+        };
+      } else {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `**${displayName}**: ${result.content}\n\nThis is a binary file and cannot be displayed as text.`,
+          }],
+        };
+      }
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading attachment: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Start the server
 async function main() {
   const transport = new StdioServerTransport();

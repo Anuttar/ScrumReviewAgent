@@ -621,6 +621,142 @@ server.tool(
   }
 );
 
+// Tool: Get Pipelines
+server.tool(
+  'get_pipelines',
+  'List all pipelines in the Azure DevOps project with their IDs, names, folders, and links.',
+  {},
+  async () => {
+    try {
+      const pipelines = await client.getPipelines();
+
+      if (pipelines.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: 'No pipelines found in this project.' }],
+        };
+      }
+
+      let text = `**Pipelines in Project** (${pipelines.length} total):\n\n`;
+      text += '| ID | Name | Folder | Link |\n';
+      text += '|----|------|--------|------|\n';
+      for (const p of pipelines) {
+        text += `| ${p.id} | ${p.name} | ${p.folder} | [Open](${p.url}) |\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching pipelines: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Pipeline Runs
+server.tool(
+  'get_pipeline_runs',
+  'Get recent runs of a specific pipeline. Shows build status, result, duration, branch, and links.',
+  {
+    pipelineId: z.number().describe('The pipeline/definition ID'),
+    top: z.number().optional().describe('Number of recent runs to fetch (default 10, max 25)'),
+  },
+  async ({ pipelineId, top }) => {
+    try {
+      const runs = await client.getPipelineRuns(pipelineId, top || 10);
+
+      if (runs.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No runs found for pipeline ${pipelineId}.` }],
+        };
+      }
+
+      let text = `**Recent Runs for Pipeline ${runs[0].name || pipelineId}** (${runs.length} shown):\n\n`;
+      text += '| Build ID | Result | Branch | Started | Duration | Link |\n';
+      text += '|----------|--------|--------|---------|----------|------|\n';
+      for (const r of runs) {
+        const resultIcon = r.result === 'succeeded' ? '✅' : r.result === 'failed' ? '❌' : r.result === 'canceled' ? '⚪' : '⚠️';
+        const started = r.startTime ? new Date(r.startTime).toLocaleString() : 'N/A';
+        let duration = '';
+        if (r.startTime && r.finishTime) {
+          const mins = Math.round((new Date(r.finishTime).getTime() - new Date(r.startTime).getTime()) / 60000);
+          duration = `${mins} min`;
+        }
+        const branch = r.sourceBranch.replace('refs/heads/', '');
+        text += `| #${r.id} | ${resultIcon} ${r.result} | ${branch} | ${started} | ${duration} | [Open](${r.url}) |\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching pipeline runs: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Pipeline Health
+server.tool(
+  'get_pipeline_health',
+  'Get health and reliability metrics for a pipeline: success rate, current streak (consecutive failures/successes), last successful/failed run, average duration, and recent run history.',
+  {
+    pipelineId: z.number().describe('The pipeline/definition ID to check health for'),
+  },
+  async ({ pipelineId }) => {
+    try {
+      const health = await client.getPipelineHealth(pipelineId);
+
+      let text = `## Pipeline Health: ${health.pipelineName}\n\n`;
+      text += `| Metric | Value |\n`;
+      text += `|--------|-------|\n`;
+      text += `| Total Runs (last 25) | ${health.totalRuns} |\n`;
+      text += `| ✅ Succeeded | ${health.succeeded} |\n`;
+      text += `| ❌ Failed | ${health.failed} |\n`;
+      text += `| ⚪ Canceled | ${health.canceled} |\n`;
+      text += `| ⚠️ Partially Succeeded | ${health.partiallySucceeded} |\n`;
+      text += `| **Success Rate** | **${health.successRate}%** |\n`;
+      text += `| Avg Duration | ${health.averageDurationMinutes} min |\n`;
+
+      text += `\n### Current Streak\n\n`;
+      const streakIcon = health.currentStreak.result === 'succeeded' ? '✅' : health.currentStreak.result === 'failed' ? '❌' : '⚪';
+      const streakSince = health.currentStreak.since ? new Date(health.currentStreak.since).toLocaleString() : 'N/A';
+      text += `${streakIcon} **${health.currentStreak.count} consecutive ${health.currentStreak.result}** runs (since ${streakSince})\n\n`;
+
+      if (health.currentStreak.result === 'failed' && health.currentStreak.count >= 3) {
+        text += `⚠️ **WARNING:** Pipeline has been failing continuously for ${health.currentStreak.count} runs!\n\n`;
+      }
+
+      text += `### Key Dates\n\n`;
+      text += `- **Last Successful:** ${health.lastSuccessful ? new Date(health.lastSuccessful).toLocaleString() : 'Never (in recent history)'}\n`;
+      text += `- **Last Failed:** ${health.lastFailed ? new Date(health.lastFailed).toLocaleString() : 'Never (in recent history)'}\n\n`;
+
+      text += `### Recent Runs\n\n`;
+      text += '| Build | Result | Branch | Time |\n';
+      text += '|-------|--------|--------|------|\n';
+      for (const r of health.recentRuns) {
+        const icon = r.result === 'succeeded' ? '✅' : r.result === 'failed' ? '❌' : '⚪';
+        const time = r.startTime ? new Date(r.startTime).toLocaleString() : 'N/A';
+        const branch = r.sourceBranch.replace('refs/heads/', '');
+        text += `| #${r.id} | ${icon} ${r.result} | ${branch} | ${time} |\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching pipeline health: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Start the server
 async function main() {
   const transport = new StdioServerTransport();

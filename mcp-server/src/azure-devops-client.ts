@@ -454,4 +454,114 @@ export class AzureDevOpsClient {
       createdDate: c.createdDate || '',
     }));
   }
+
+  async getPipelines(): Promise<{ id: number; name: string; folder: string; url: string }[]> {
+    const url = `${this.projectUrl}/_apis/pipelines?api-version=7.0`;
+    const result = await this.request<{ value: any[] }>(url);
+
+    return (result.value || []).map((p: any) => ({
+      id: p.id,
+      name: p.name,
+      folder: p.folder || '\\',
+      url: `${this.config.orgUrl}/${this.config.project}/_build?definitionId=${p.id}`,
+    }));
+  }
+
+  async getPipelineRuns(
+    pipelineId: number,
+    top: number = 10
+  ): Promise<{ id: number; name: string; state: string; result: string; startTime: string; finishTime: string; sourceBranch: string; url: string }[]> {
+    const url = `${this.projectUrl}/_apis/build/builds?definitions=${pipelineId}&$top=${top}&api-version=7.0`;
+    const result = await this.request<{ value: any[] }>(url);
+
+    return (result.value || []).map((r: any) => ({
+      id: r.id,
+      name: r.definition?.name || '',
+      state: r.status || '',
+      result: r.result || 'inProgress',
+      startTime: r.startTime || '',
+      finishTime: r.finishTime || '',
+      sourceBranch: r.sourceBranch || '',
+      url: r._links?.web?.href || `${this.config.orgUrl}/${this.config.project}/_build/results?buildId=${r.id}`,
+    }));
+  }
+
+  async getPipelineHealth(pipelineId: number): Promise<{
+    pipelineName: string;
+    totalRuns: number;
+    succeeded: number;
+    failed: number;
+    canceled: number;
+    partiallySucceeded: number;
+    successRate: number;
+    currentStreak: { result: string; count: number; since: string };
+    lastSuccessful: string | null;
+    lastFailed: string | null;
+    averageDurationMinutes: number;
+    recentRuns: { id: number; result: string; startTime: string; finishTime: string; sourceBranch: string }[];
+  }> {
+    const runs = await this.getPipelineRuns(pipelineId, 25);
+
+    const pipelineName = runs.length > 0 ? runs[0].name : `Pipeline ${pipelineId}`;
+    const completedRuns = runs.filter(r => r.state === 'completed');
+
+    const succeeded = completedRuns.filter(r => r.result === 'succeeded').length;
+    const failed = completedRuns.filter(r => r.result === 'failed').length;
+    const canceled = completedRuns.filter(r => r.result === 'canceled').length;
+    const partiallySucceeded = completedRuns.filter(r => r.result === 'partiallySucceeded').length;
+    const totalRuns = completedRuns.length;
+    const successRate = totalRuns > 0 ? Math.round((succeeded / totalRuns) * 100) : 0;
+
+    // Calculate current streak
+    let streakResult = completedRuns.length > 0 ? completedRuns[0].result : 'none';
+    let streakCount = 0;
+    let streakSince = '';
+    for (const run of completedRuns) {
+      if (run.result === streakResult) {
+        streakCount++;
+        streakSince = run.startTime;
+      } else {
+        break;
+      }
+    }
+
+    // Last successful and last failed
+    const lastSuccessfulRun = completedRuns.find(r => r.result === 'succeeded');
+    const lastFailedRun = completedRuns.find(r => r.result === 'failed');
+
+    // Average duration
+    let totalDuration = 0;
+    let durationCount = 0;
+    for (const run of completedRuns) {
+      if (run.startTime && run.finishTime) {
+        const duration = new Date(run.finishTime).getTime() - new Date(run.startTime).getTime();
+        if (duration > 0) {
+          totalDuration += duration;
+          durationCount++;
+        }
+      }
+    }
+    const averageDurationMinutes = durationCount > 0 ? Math.round(totalDuration / durationCount / 60000 * 10) / 10 : 0;
+
+    return {
+      pipelineName,
+      totalRuns,
+      succeeded,
+      failed,
+      canceled,
+      partiallySucceeded,
+      successRate,
+      currentStreak: { result: streakResult, count: streakCount, since: streakSince },
+      lastSuccessful: lastSuccessfulRun?.finishTime || null,
+      lastFailed: lastFailedRun?.finishTime || null,
+      averageDurationMinutes,
+      recentRuns: completedRuns.slice(0, 10).map(r => ({
+        id: r.id,
+        result: r.result,
+        startTime: r.startTime,
+        finishTime: r.finishTime,
+        sourceBranch: r.sourceBranch,
+      })),
+    };
+  }
 }

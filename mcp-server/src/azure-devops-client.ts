@@ -37,6 +37,38 @@ export interface TeamMemberCapacity {
   daysOff: { start: string; end: string }[];
 }
 
+export interface RetrospectiveBoard {
+  id: string;
+  title: string;
+  teamId: string;
+  createdDate: string;
+  columns: { id: string; title: string }[];
+  rawData?: any;
+}
+
+export interface RetrospectiveFeedbackItem {
+  id: string;
+  boardId: string;
+  title: string;
+  columnId: string;
+  createdBy: string;
+  createdDate: string;
+  upvotes: number;
+  isGroupedCarryOver: boolean;
+  childItems: number;
+  actionItems: string[];
+}
+
+export interface RetrospectiveAnalysis {
+  board: { id: string; title: string; createdDate: string };
+  columns: string[];
+  totalItems: number;
+  categorizedItems: Record<string, RetrospectiveFeedbackItem[]>;
+  wentWell: RetrospectiveFeedbackItem[];
+  didntGoWell: RetrospectiveFeedbackItem[];
+  actionItems: RetrospectiveFeedbackItem[];
+}
+
 export class AzureDevOpsClient {
   private config: AzureDevOpsConfig;
   private headers: Record<string, string>;
@@ -58,6 +90,16 @@ export class AzureDevOpsClient {
     return `${this.config.orgUrl}/${this.config.project}`;
   }
 
+  private get extMgmtUrl(): string {
+    // Azure DevOps Services uses extmgmt.dev.azure.com for extension management APIs
+    const orgUrl = this.config.orgUrl;
+    if (orgUrl.includes('dev.azure.com')) {
+      return orgUrl.replace('dev.azure.com', 'extmgmt.dev.azure.com');
+    }
+    // On-premises Azure DevOps Server uses the same base URL
+    return orgUrl;
+  }
+
   private async request<T>(url: string, method: string = 'GET', body?: unknown): Promise<T> {
     const response = await fetch(url, {
       method,
@@ -71,6 +113,13 @@ export class AzureDevOpsClient {
     }
 
     return response.json() as Promise<T>;
+  }
+
+  async getTeamId(): Promise<string> {
+    // Resolve team name to team ID (GUID) using the Teams API
+    const url = `${this.config.orgUrl}/_apis/projects/${this.config.project}/teams/${encodeURIComponent(this.config.team)}?api-version=7.0`;
+    const result = await this.request<{ id: string; name: string }>(url);
+    return result.id;
   }
 
   async getCurrentSprint(): Promise<SprintInfo> {
@@ -670,6 +719,142 @@ export class AzureDevOpsClient {
       }
       throw error;
     }
+  }
+
+  // ─── Retrospective Board Methods ───────────────────────────────────────────
+
+  async getRetrospectiveBoards(teamId?: string): Promise<RetrospectiveBoard[]> {
+    // The Retrospectives extension uses the Team ID (GUID) as the collection name for boards
+    const extPublisher = 'ms-devlabs';
+    const extId = 'team-retrospectives';
+
+    // Resolve team GUID if not provided
+    const resolvedTeamId = teamId || await this.getTeamId();
+
+    const url = `${this.extMgmtUrl}/_apis/ExtensionManagement/InstalledExtensions/${extPublisher}/${extId}/Data/Scopes/Default/Current/Collections/${resolvedTeamId}/Documents?api-version=7.0-preview.1`;
+
+    try {
+      const result = await this.request<any>(url);
+
+      // Handle both response formats: { value: [...] } or direct array
+      const documents: any[] = Array.isArray(result) ? result : (result.value || []);
+
+      return documents.map((board: any) => ({
+        id: board.id || board.__etag,
+        title: board.title || 'Untitled Board',
+        teamId: board.teamId || resolvedTeamId,
+        createdDate: board.createdDate || '',
+        columns: (board.columns || []).map((col: any) => ({
+          id: col.id,
+          title: col.title,
+        })),
+        rawData: board,
+      }));
+    } catch (error: any) {
+      throw new Error(
+        `Unable to fetch retrospective boards for team "${this.config.team}" (ID: ${resolvedTeamId}). ` +
+        `Ensure the "Retrospectives" extension (ms-devlabs.team-retrospectives) is installed ` +
+        `and at least one retro board exists. Error: ${error.message}`
+      );
+    }
+  }
+
+  async getRetrospectiveBoardItems(boardId: string): Promise<RetrospectiveFeedbackItem[]> {
+    // The Retrospectives extension uses the Board ID (GUID) as the collection name for feedback items
+    const extPublisher = 'ms-devlabs';
+    const extId = 'team-retrospectives';
+
+    const url = `${this.extMgmtUrl}/_apis/ExtensionManagement/InstalledExtensions/${extPublisher}/${extId}/Data/Scopes/Default/Current/Collections/${boardId}/Documents?api-version=7.0-preview.1`;
+
+    try {
+      const result = await this.request<any>(url);
+
+      // Handle both response formats: { value: [...] } or direct array
+      const documents: any[] = Array.isArray(result) ? result : (result.value || []);
+
+      return documents.map((item: any) => ({
+        id: item.id || '',
+        boardId: item.boardId || boardId,
+        title: item.title || item.feedbackText || '',
+        columnId: item.columnId || '',
+        createdBy: item.createdBy?.displayName || item.createdByProfileImage || 'Unknown',
+        createdDate: item.createdDate || '',
+        upvotes: item.upvotes || item.upVoteCount || 0,
+        isGroupedCarryOver: item.isGroupedCarryOver || false,
+        childItems: (item.childFeedbackItemIds || []).length,
+        actionItems: item.associatedActionItemIds || [],
+      }));
+    } catch (error: any) {
+      if (error.message?.includes('DocumentCollectionDoesNotExist')) {
+        return []; // Board has no feedback items yet
+      }
+      throw new Error(`Unable to fetch feedback items for board "${boardId}". Error: ${error.message}`);
+    }
+  }
+
+  async getRetrospectiveAnalysis(boardId: string): Promise<RetrospectiveAnalysis> {
+    const boards = await this.getRetrospectiveBoards();
+    const board = boards.find(b => b.id === boardId);
+
+    if (!board) {
+      throw new Error(`Retrospective board "${boardId}" not found. Available boards: ${boards.map(b => `${b.title} (${b.id})`).join(', ')}`);
+    }
+
+    const items = await this.getRetrospectiveBoardItems(boardId);
+
+    // Map columns by ID
+    const columnMap: Record<string, string> = {};
+    for (const col of board.columns) {
+      columnMap[col.id] = col.title;
+    }
+
+    // Categorize items into columns
+    const categorizedItems: Record<string, RetrospectiveFeedbackItem[]> = {};
+    for (const item of items) {
+      const columnTitle = columnMap[item.columnId] || 'Uncategorized';
+      if (!categorizedItems[columnTitle]) {
+        categorizedItems[columnTitle] = [];
+      }
+      categorizedItems[columnTitle].push(item);
+    }
+
+    // Sort items by upvotes within each category
+    for (const col of Object.keys(categorizedItems)) {
+      categorizedItems[col].sort((a, b) => b.upvotes - a.upvotes);
+    }
+
+    // Identify "What Went Well" and "What Didn't Go Well" columns
+    const wellColumnNames = ['what went well', 'went well', 'good', 'keep doing', 'liked', 'positives', 'start'];
+    const notWellColumnNames = ['what didn\'t go well', 'didn\'t go well', 'improve', 'stop doing', 'disliked', 'negatives', 'stop', 'issues', 'problems'];
+
+    let wentWell: RetrospectiveFeedbackItem[] = [];
+    let didntGoWell: RetrospectiveFeedbackItem[] = [];
+    let actionItems: RetrospectiveFeedbackItem[] = [];
+
+    for (const [colTitle, colItems] of Object.entries(categorizedItems)) {
+      const lower = colTitle.toLowerCase();
+      if (wellColumnNames.some(n => lower.includes(n))) {
+        wentWell = [...wentWell, ...colItems];
+      } else if (notWellColumnNames.some(n => lower.includes(n))) {
+        didntGoWell = [...didntGoWell, ...colItems];
+      } else if (lower.includes('action') || lower.includes('todo') || lower.includes('try')) {
+        actionItems = [...actionItems, ...colItems];
+      }
+    }
+
+    return {
+      board: {
+        id: board.id,
+        title: board.title,
+        createdDate: board.createdDate,
+      },
+      columns: board.columns.map(c => c.title),
+      totalItems: items.length,
+      categorizedItems,
+      wentWell,
+      didntGoWell,
+      actionItems,
+    };
   }
 
   async updateWorkItemFields(

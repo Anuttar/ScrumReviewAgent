@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import fetch from 'node-fetch';
 import { AzureDevOpsClient, AzureDevOpsConfig } from './azure-devops-client.js';
 
 const execFileAsync = promisify(execFile);
@@ -1223,6 +1224,218 @@ Note: Does NOT update comments — use a separate tool for that.`,
     } catch (error: any) {
       return {
         content: [{ type: 'text' as const, text: `Error updating work item: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Retrospective Boards
+server.tool(
+  'get_retrospective_boards',
+  'List all retrospective boards for a team in your Azure DevOps project. Use this to find board IDs before fetching board details. If no teamName is specified, uses the configured team.',
+  {
+    teamName: z.string().optional().describe('Team name to fetch boards for (e.g. "Code4", "PDS_Avengers"). If not provided, uses the configured team.'),
+  },
+  async ({ teamName }) => {
+    try {
+      let teamId: string | undefined;
+      if (teamName) {
+        // Resolve custom team name to GUID
+        const teamUrl = `${process.env.AZURE_DEVOPS_ORG_URL}/_apis/projects/${process.env.AZURE_DEVOPS_PROJECT}/teams/${encodeURIComponent(teamName)}?api-version=7.0`;
+        const token = Buffer.from(`:${process.env.AZURE_DEVOPS_PAT}`).toString('base64');
+        const resp = await fetch(teamUrl, { headers: { 'Authorization': `Basic ${token}`, 'Content-Type': 'application/json' } });
+        if (!resp.ok) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: Team "${teamName}" not found in project. Check the team name.` }],
+            isError: true,
+          };
+        }
+        const teamData = await resp.json() as any;
+        teamId = teamData.id;
+      }
+
+      const boards = await client.getRetrospectiveBoards(teamId);
+
+      if (boards.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `No retrospective boards found for team "${teamName || process.env.AZURE_DEVOPS_TEAM}".` +
+              (teamId ? ` (Team ID: ${teamId})` : '') +
+              ` Ensure the "Retrospectives" extension is installed and at least one retro board has been created.` +
+              `\n\nTip: If boards exist under a different team, try specifying the team name explicitly.`,
+          }],
+        };
+      }
+
+      let text = `**Retrospective Boards for Team: ${teamName || process.env.AZURE_DEVOPS_TEAM}** (${boards.length} total):\n\n`;
+      text += '| # | Title | Created | Columns | Board ID |\n';
+      text += '|---|-------|---------|---------|----------|\n';
+      boards.forEach((b, i) => {
+        const date = b.createdDate ? new Date(b.createdDate).toLocaleDateString() : 'N/A';
+        const cols = b.columns.map(c => c.title).join(', ') || 'N/A';
+        text += `| ${i + 1} | ${b.title} | ${date} | ${cols} | ${b.id} |\n`;
+      });
+      text += `\nUse **get_retrospective_analysis** with a Board ID to get full retrospective insights.`;
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching retrospective boards: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Retrospective Analysis
+server.tool(
+  'get_retrospective_analysis',
+  'Get full retrospective analysis for a board: what went well, what didn\'t go well, action items, team sentiment insights, and SARA recommendations. Provides categorized feedback with upvote counts and contributor analysis.',
+  {
+    boardId: z.string().describe('The retrospective board ID. Use get_retrospective_boards to find it.'),
+  },
+  async ({ boardId }) => {
+    try {
+      const analysis = await client.getRetrospectiveAnalysis(boardId);
+
+      let text = '';
+
+      // Header
+      text += `# 🔄 Retrospective Analysis: ${analysis.board.title}\n\n`;
+      if (analysis.board.createdDate) {
+        text += `📅 **Board Created:** ${new Date(analysis.board.createdDate).toLocaleDateString()}\n`;
+      }
+      text += `📊 **Total Feedback Items:** ${analysis.totalItems}\n`;
+      text += `📋 **Columns:** ${analysis.columns.join(' | ')}\n\n`;
+      text += `---\n\n`;
+
+      // What Went Well
+      text += `## 🤝 What Went Well (${analysis.wentWell.length} items)\n\n`;
+      if (analysis.wentWell.length > 0) {
+        for (const item of analysis.wentWell) {
+          const votes = item.upvotes > 0 ? ` (👍 ${item.upvotes})` : '';
+          text += `- **${item.createdBy}**: ${item.title}${votes}\n`;
+        }
+      } else {
+        text += `_No items in "What Went Well" category._\n`;
+      }
+      text += `\n---\n\n`;
+
+      // What Didn't Go Well
+      text += `## ⚠️ What Didn't Go Well (${analysis.didntGoWell.length} items)\n\n`;
+      if (analysis.didntGoWell.length > 0) {
+        for (const item of analysis.didntGoWell) {
+          const votes = item.upvotes > 0 ? ` (👍 ${item.upvotes})` : '';
+          text += `- **${item.createdBy}**: ${item.title}${votes}\n`;
+        }
+      } else {
+        text += `_No items in "What Didn't Go Well" category._\n`;
+      }
+      text += `\n---\n\n`;
+
+      // Action Items
+      if (analysis.actionItems.length > 0) {
+        text += `## 📌 Action Items / Try Next (${analysis.actionItems.length} items)\n\n`;
+        for (const item of analysis.actionItems) {
+          const votes = item.upvotes > 0 ? ` (👍 ${item.upvotes})` : '';
+          text += `- **${item.createdBy}**: ${item.title}${votes}\n`;
+        }
+        text += `\n---\n\n`;
+      }
+
+      // Full breakdown by column (for any custom columns)
+      const knownColumns = [...analysis.wentWell, ...analysis.didntGoWell, ...analysis.actionItems].map(i => i.id);
+      const uncategorized = Object.entries(analysis.categorizedItems).filter(([colTitle]) => {
+        const lower = colTitle.toLowerCase();
+        const isKnown = ['what went well', 'went well', 'good', 'keep doing', 'liked', 'positives', 'start',
+          'what didn\'t go well', 'didn\'t go well', 'improve', 'stop doing', 'disliked', 'negatives', 'stop', 'issues', 'problems',
+          'action', 'todo', 'try'].some(n => lower.includes(n));
+        return !isKnown;
+      });
+
+      if (uncategorized.length > 0) {
+        text += `## 📂 Other Columns\n\n`;
+        for (const [colTitle, colItems] of uncategorized) {
+          text += `### ${colTitle} (${colItems.length} items)\n`;
+          for (const item of colItems) {
+            const votes = item.upvotes > 0 ? ` (👍 ${item.upvotes})` : '';
+            text += `- **${item.createdBy}**: ${item.title}${votes}\n`;
+          }
+          text += `\n`;
+        }
+        text += `---\n\n`;
+      }
+
+      // ─── SARA Insights ───────────────────────────────────────────────────────
+      text += `## 💡 SARA Insights & Recommendations\n\n`;
+
+      const insights: string[] = [];
+
+      // Team participation analysis
+      const allItems = Object.values(analysis.categorizedItems).flat();
+      const contributors = [...new Set(allItems.map(i => i.createdBy))];
+      insights.push(`👥 **Team Participation:** ${contributors.length} contributor(s) provided feedback`);
+
+      // Sentiment balance
+      const wellCount = analysis.wentWell.length;
+      const notWellCount = analysis.didntGoWell.length;
+      const total = wellCount + notWellCount;
+      if (total > 0) {
+        const positiveRatio = Math.round((wellCount / total) * 100);
+        if (positiveRatio >= 70) {
+          insights.push(`🌟 **Positive Sprint Sentiment** — ${positiveRatio}% of feedback is positive. Team morale appears strong.`);
+        } else if (positiveRatio <= 30) {
+          insights.push(`🚨 **Low Sprint Sentiment** — Only ${positiveRatio}% positive feedback. Consider a focused improvement session.`);
+        } else {
+          insights.push(`⚖️ **Balanced Sentiment** — ${positiveRatio}% positive / ${100 - positiveRatio}% improvement areas. Healthy retrospective balance.`);
+        }
+      }
+
+      // Most upvoted concerns
+      const topConcerns = analysis.didntGoWell.filter(i => i.upvotes >= 2);
+      if (topConcerns.length > 0) {
+        insights.push(`🔥 **Top Team Concerns (2+ votes):**`);
+        for (const concern of topConcerns.slice(0, 3)) {
+          insights.push(`   - "${concern.title}" (👍 ${concern.upvotes} votes)`);
+        }
+      }
+
+      // Most celebrated successes
+      const topSuccesses = analysis.wentWell.filter(i => i.upvotes >= 2);
+      if (topSuccesses.length > 0) {
+        insights.push(`🏆 **Top Celebrations (2+ votes):**`);
+        for (const success of topSuccesses.slice(0, 3)) {
+          insights.push(`   - "${success.title}" (👍 ${success.upvotes} votes)`);
+        }
+      }
+
+      // Action items coverage
+      if (analysis.actionItems.length === 0 && notWellCount > 0) {
+        insights.push(`⚠️ **No Action Items Defined** — There are ${notWellCount} improvement areas but no action items. Recommend defining at least 1-2 concrete actions for next sprint.`);
+      } else if (analysis.actionItems.length > 0) {
+        insights.push(`✅ **${analysis.actionItems.length} Action Item(s)** defined for improvement.`);
+      }
+
+      // Carryover risk
+      const carryovers = allItems.filter(i => i.isGroupedCarryOver);
+      if (carryovers.length > 0) {
+        insights.push(`🔁 **${carryovers.length} carried-over item(s)** from previous retrospectives — indicates recurring unresolved issues.`);
+      }
+
+      for (const insight of insights) {
+        text += `- ${insight}\n`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error analyzing retrospective board: ${error.message}` }],
         isError: true,
       };
     }

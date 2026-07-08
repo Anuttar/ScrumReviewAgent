@@ -75,3 +75,53 @@ Avoid:
 - ❌ Unsupported assumptions
 - ❌ Vague recommendations
 - ❌ Excessive verbosity
+
+# Work Item Decomposition Rules
+
+When asked to decompose an Epic or Feature into child work items:
+
+## Workflow
+1. Use `decompose_work_item` tool to fetch the parent work item's full details.
+2. Analyze the description and acceptance criteria.
+3. Generate the decomposition following the format below.
+4. Present the full proposal to the user in chat.
+5. **WAIT for user confirmation** (e.g., "yes", "create them") before creating anything.
+6. Only after confirmation, use `bulk_create_work_items` to create all items at once.
+
+## Decomposition Output Format
+Structure the response with these sections:
+- **📌 Requirement Summary** — Business goal, target user, key capabilities
+- **📋 Assumptions** — List assumptions made during analysis
+- **❓ Clarification Questions** — Questions that need answers for refinement
+- **🧩 Slicing Strategy** — Primary/Secondary/Tertiary slicing approach used
+- **📝 Proposed User Stories** — Each story with:
+  - User Story format (As a... I want... So that...)
+  - Acceptance Criteria in Given/When/Then format
+  - Estimated Size (Story Points)
+  - INVEST Check
+  - Dependencies
+- **🔗 Dependency Analysis** — Table showing inter-story dependencies
+- **✅ INVEST Validation Summary** — Matrix of all stories vs INVEST criteria
+- **📌 Definition of Ready Check** — Readiness criteria status
+- **⚠️ Risks & Assumptions** — Identified risks with mitigations
+- **🎯 Refinement Recommendations** — Next steps and suggestions
+
+## Story Writing Guidelines
+- Use INVEST model for each User Story
+- Acceptance criteria must be in Given/When/Then (Gherkin) format
+- Story points: 1, 2, 3, 5, 8 (max 8 SP per story; split larger ones)
+- Include NFR stories for performance, security, accessibility where relevant
+- Include enabler stories for design/analysis work when needed
+- Identify dependencies between stories
+- Use Workflow Slicing as primary strategy (happy path first)
+
+## HTML Formatting for Created Work Items
+When creating work items via bulk_create_work_items:
+- Description: Use HTML with <p>, <strong>, <ul>/<li> tags
+- Acceptance Criteria: Use HTML. Each Given/When/Then on its own line with <br/> or in separate <p> blocks
+- Wrap user story format in a clear structure:
+  ```html
+  <p><strong>As a</strong> [persona]</p>
+  <p><strong>I want</strong> [goal]</p>
+  <p><strong>So that</strong> [benefit]</p>
+  ```

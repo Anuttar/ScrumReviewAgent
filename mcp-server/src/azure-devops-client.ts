@@ -320,6 +320,7 @@ export class AzureDevOpsClient {
     title: string,
     options?: {
       description?: string;
+      acceptanceCriteria?: string;
       assignedTo?: string;
       iterationPath?: string;
       areaPath?: string;
@@ -327,6 +328,7 @@ export class AzureDevOpsClient {
       storyPoints?: number;
       tags?: string;
       parentId?: number;
+      priority?: number;
     }
   ): Promise<{ id: number; title: string; url: string }> {
     const patchDocument: any[] = [
@@ -335,6 +337,9 @@ export class AzureDevOpsClient {
 
     if (options?.description) {
       patchDocument.push({ op: 'add', path: '/fields/System.Description', value: options.description });
+    }
+    if (options?.acceptanceCriteria) {
+      patchDocument.push({ op: 'add', path: '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', value: options.acceptanceCriteria });
     }
     if (options?.assignedTo) {
       patchDocument.push({ op: 'add', path: '/fields/System.AssignedTo', value: options.assignedTo });
@@ -350,6 +355,9 @@ export class AzureDevOpsClient {
     }
     if (options?.storyPoints !== undefined) {
       patchDocument.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.StoryPoints', value: options.storyPoints });
+    }
+    if (options?.priority !== undefined) {
+      patchDocument.push({ op: 'add', path: '/fields/Microsoft.VSTS.Common.Priority', value: options.priority });
     }
     if (options?.tags) {
       patchDocument.push({ op: 'add', path: '/fields/System.Tags', value: options.tags });

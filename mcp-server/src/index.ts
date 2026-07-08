@@ -428,24 +428,28 @@ server.tool(
       .describe('The type of work item to create'),
     title: z.string().describe('Title of the work item'),
     description: z.string().optional().describe('Detailed description of the work item (supports HTML)'),
+    acceptanceCriteria: z.string().optional().describe('Acceptance criteria for the work item (supports HTML, use Given/When/Then format)'),
     assignedTo: z.string().optional().describe('Display name or email of the person to assign the work item to'),
     iterationPath: z.string().optional()
       .describe('Iteration path (e.g. "PLM\\PDS\\2026\\Avengers\\Q4\\Sprint 14"). If not provided, defaults to the project root iteration.'),
     areaPath: z.string().optional().describe('Area path for the work item'),
     state: z.string().optional().describe('Initial state (e.g. "New", "Active"). Defaults to "New".'),
     storyPoints: z.number().optional().describe('Story points estimate (for User Stories/PBIs)'),
+    priority: z.number().optional().describe('Priority (1=Critical, 2=High, 3=Medium, 4=Low)'),
     tags: z.string().optional().describe('Semicolon-separated tags (e.g. "Frontend; Bug; Sprint14")'),
     parentId: z.number().optional().describe('ID of the parent work item to link this as a child of'),
   },
-  async ({ workItemType, title, description, assignedTo, iterationPath, areaPath, state, storyPoints, tags, parentId }) => {
+  async ({ workItemType, title, description, acceptanceCriteria, assignedTo, iterationPath, areaPath, state, storyPoints, priority, tags, parentId }) => {
     try {
       const result = await client.createWorkItem(workItemType, title, {
         description,
+        acceptanceCriteria,
         assignedTo,
         iterationPath,
         areaPath,
         state,
         storyPoints,
+        priority,
         tags,
         parentId,
       });
@@ -1511,6 +1515,257 @@ server.tool(
     } catch (error: any) {
       return {
         content: [{ type: 'text' as const, text: `Error managing comment: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Decompose Work Item (fetch Epic/Feature details for decomposition)
+server.tool(
+  'decompose_work_item',
+  'Fetch full details of an Epic or Feature work item to analyze and decompose into child Features/User Stories. Returns the work item title, description, acceptance criteria, existing children, and metadata needed for intelligent decomposition. After analyzing, present the proposed breakdown to the user and wait for confirmation before creating.',
+  {
+    workItemId: z.number().describe('The ID of the Epic or Feature work item to decompose'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const fields = await client.getWorkItemFields(workItemId);
+
+      // Build a field map
+      const f: Record<string, any> = {};
+      for (const field of fields) {
+        let val = field.value;
+        if (val && typeof val === 'object') {
+          val = val.displayName || val.name || JSON.stringify(val);
+        }
+        f[field.referenceName] = val ?? '';
+      }
+
+      const title = f['System.Title'] || '';
+      const workItemType = f['System.WorkItemType'] || '';
+      const description = f['System.Description'] || '';
+      const acceptanceCriteria = f['Microsoft.VSTS.Common.AcceptanceCriteria'] || '';
+      const state = f['System.State'] || '';
+      const areaPath = f['System.AreaPath'] || '';
+      const iterationPath = f['System.IterationPath'] || '';
+      const tags = f['System.Tags'] || '';
+      const priority = f['Microsoft.VSTS.Common.Priority'] || '';
+      const storyPoints = f['Microsoft.VSTS.Scheduling.StoryPoints'] || '';
+      const assignedTo = f['System.AssignedTo'] || 'Unassigned';
+
+      // Validate work item type
+      const validTypes = ['Epic', 'Feature'];
+      if (!validTypes.includes(workItemType)) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `⚠️ Work item #${workItemId} is a **${workItemType}**, not an Epic or Feature. Decomposition works best with Epics (→ Features → User Stories) or Features (→ User Stories). Proceed with caution or provide an Epic/Feature ID.`,
+          }],
+        };
+      }
+
+      // Get existing children
+      let existingChildren: any[] = [];
+      try {
+        existingChildren = await client.getWorkItemChildren(workItemId);
+      } catch {
+        // No children or error fetching
+      }
+
+      // HTML to plain text helper
+      const stripHtml = (html: string) => {
+        if (!html) return '';
+        let text = html;
+        text = text.replace(/<br\s*\/?>/gi, '\n');
+        text = text.replace(/<\/p>\s*<p[^>]*>/gi, '\n\n');
+        text = text.replace(/<p[^>]*>/gi, '');
+        text = text.replace(/<\/p>/gi, '\n');
+        text = text.replace(/<(strong|b)>/gi, '**');
+        text = text.replace(/<\/(strong|b)>/gi, '**');
+        text = text.replace(/<(em|i)>/gi, '*');
+        text = text.replace(/<\/(em|i)>/gi, '*');
+        text = text.replace(/<li[^>]*>/gi, '- ');
+        text = text.replace(/<\/li>/gi, '\n');
+        text = text.replace(/<\/?(ul|ol|div|span|table|tr|td|th|thead|tbody|h[1-6])[^>]*>/gi, '');
+        text = text.replace(/<img[^>]*>/gi, '');
+        text = text.replace(/<a[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+        text = text.replace(/<[^>]*>/g, '');
+        text = text.replace(/&nbsp;/g, ' ');
+        text = text.replace(/&amp;/g, '&');
+        text = text.replace(/&lt;/g, '<');
+        text = text.replace(/&gt;/g, '>');
+        text = text.replace(/&quot;/g, '"');
+        text = text.replace(/[ \t]+/g, ' ');
+        text = text.replace(/\n{3,}/g, '\n\n');
+        return text.trim();
+      };
+
+      const descriptionText = stripHtml(description);
+      const acText = stripHtml(acceptanceCriteria);
+
+      let output = `# 📋 Work Item for Decomposition\n\n`;
+      output += `## Basic Info\n`;
+      output += `| Field | Value |\n|-------|-------|\n`;
+      output += `| **ID** | #${workItemId} |\n`;
+      output += `| **Type** | ${workItemType} |\n`;
+      output += `| **Title** | ${title} |\n`;
+      output += `| **State** | ${state} |\n`;
+      output += `| **Assigned To** | ${assignedTo} |\n`;
+      output += `| **Area Path** | ${areaPath} |\n`;
+      output += `| **Iteration Path** | ${iterationPath} |\n`;
+      if (priority) output += `| **Priority** | ${priority} |\n`;
+      if (storyPoints) output += `| **Story Points** | ${storyPoints} |\n`;
+      if (tags) output += `| **Tags** | ${tags} |\n`;
+      output += `\n---\n\n`;
+
+      if (descriptionText) {
+        output += `## Description\n\n${descriptionText}\n\n---\n\n`;
+      } else {
+        output += `## Description\n\n_No description provided._\n\n---\n\n`;
+      }
+
+      if (acText) {
+        output += `## Acceptance Criteria\n\n${acText}\n\n---\n\n`;
+      }
+
+      if (existingChildren.length > 0) {
+        output += `## Existing Children (${existingChildren.length})\n\n`;
+        output += `| ID | Type | Title | State |\n|-----|------|-------|-------|\n`;
+        for (const child of existingChildren) {
+          output += `| #${child.id} | ${child.workItemType || ''} | ${child.title || ''} | ${child.state || ''} |\n`;
+        }
+        output += `\n---\n\n`;
+      }
+
+      output += `## Decomposition Instructions\n\n`;
+      if (workItemType === 'Epic') {
+        output += `This is an **Epic**. Decompose into **Features** first, then each Feature into **User Stories** with acceptance criteria.\n`;
+      } else {
+        output += `This is a **Feature**. Decompose into **User Stories** with proper acceptance criteria (Given/When/Then format).\n`;
+      }
+      output += `\nUse the INVEST model for each User Story:\n`;
+      output += `- **I**ndependent — self-contained, no inherent dependency on another story\n`;
+      output += `- **N**egotiable — not an explicit contract; leave room for discussion\n`;
+      output += `- **V**aluable — delivers value to the end user\n`;
+      output += `- **E**stimable — can be estimated in story points\n`;
+      output += `- **S**mall — fits within a single sprint\n`;
+      output += `- **T**estable — has clear acceptance criteria\n`;
+      output += `\nAfter analysis, present the full decomposition to the user. Only create work items after user confirmation.`;
+
+      return {
+        content: [{ type: 'text' as const, text: output }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error fetching work item #${workItemId}: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Bulk Create Work Items (create multiple child work items at once)
+server.tool(
+  'bulk_create_work_items',
+  'Create multiple work items in Azure DevOps at once (e.g., User Stories under a Feature, or Features under an Epic). Each item can have title, description, acceptance criteria, story points, and will be linked as a child of the specified parent. Use this after user confirms the proposed decomposition.',
+  {
+    parentId: z.number().describe('The parent work item ID to link all created items under'),
+    items: z.array(z.object({
+      workItemType: z.enum(['User Story', 'Feature', 'Task', 'Bug'])
+        .describe('Type of work item to create'),
+      title: z.string().describe('Title of the work item'),
+      description: z.string().optional().describe('Description in HTML format'),
+      acceptanceCriteria: z.string().optional().describe('Acceptance criteria in HTML format (Given/When/Then)'),
+      storyPoints: z.number().optional().describe('Story points estimate'),
+      priority: z.number().optional().describe('Priority (1=Critical, 2=High, 3=Medium, 4=Low)'),
+      tags: z.string().optional().describe('Semicolon-separated tags'),
+    })).describe('Array of work items to create'),
+    iterationPath: z.string().optional().describe('Iteration path for all items (if same)'),
+    areaPath: z.string().optional().describe('Area path for all items (if same)'),
+  },
+  async ({ parentId, items, iterationPath, areaPath }) => {
+    try {
+      // Validate parent exists
+      const parentCheck = await client.checkWorkItemExists(parentId);
+      if (!parentCheck.exists) {
+        return {
+          content: [{ type: 'text' as const, text: `❌ Parent work item #${parentId} does not exist.` }],
+          isError: true,
+        };
+      }
+
+      const results: { id: number; type: string; title: string; url: string; success: boolean; error?: string }[] = [];
+
+      for (const item of items) {
+        try {
+          const result = await client.createWorkItem(item.workItemType, item.title, {
+            description: item.description,
+            acceptanceCriteria: item.acceptanceCriteria,
+            storyPoints: item.storyPoints,
+            priority: item.priority,
+            tags: item.tags,
+            parentId,
+            iterationPath,
+            areaPath,
+          });
+          results.push({
+            id: result.id,
+            type: item.workItemType,
+            title: item.title,
+            url: result.url,
+            success: true,
+          });
+        } catch (err: any) {
+          results.push({
+            id: 0,
+            type: item.workItemType,
+            title: item.title,
+            url: '',
+            success: false,
+            error: err.message,
+          });
+        }
+      }
+
+      const successful = results.filter(r => r.success);
+      const failed = results.filter(r => !r.success);
+
+      let output = `# ✅ Bulk Work Item Creation Summary\n\n`;
+      output += `**Parent:** ${parentCheck.workItemType} #${parentId} — ${parentCheck.title}\n\n`;
+      output += `**Created:** ${successful.length} / ${items.length} items\n\n`;
+
+      if (successful.length > 0) {
+        output += `## Successfully Created\n\n`;
+        output += `| # | Type | ID | Title | Link |\n`;
+        output += `|---|------|----|-------|------|\n`;
+        successful.forEach((r, i) => {
+          output += `| ${i + 1} | ${r.type} | #${r.id} | ${r.title} | [Open](${r.url}) |\n`;
+        });
+        output += `\n`;
+      }
+
+      if (failed.length > 0) {
+        output += `## ❌ Failed\n\n`;
+        output += `| # | Type | Title | Error |\n`;
+        output += `|---|------|-------|-------|\n`;
+        failed.forEach((r, i) => {
+          output += `| ${i + 1} | ${r.type} | ${r.title} | ${r.error} |\n`;
+        });
+        output += `\n`;
+      }
+
+      const totalSP = items.reduce((sum, item) => sum + (item.storyPoints || 0), 0);
+      output += `---\n\n`;
+      output += `**📊 Total Story Points:** ${totalSP}\n`;
+      output += `**🔗 All items linked as children of #${parentId}**\n`;
+
+      return {
+        content: [{ type: 'text' as const, text: output }],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error in bulk creation: ${error.message}` }],
         isError: true,
       };
     }

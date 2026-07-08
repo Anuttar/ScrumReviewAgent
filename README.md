@@ -1,4 +1,4 @@
-# Sprint Review Agent
+# SARA(Scrum Assistant for Reporting and Automation)
 
 An AI-powered Scrum Sprint Review agent that connects to Azure DevOps Server via MCP (Model Context Protocol) to analyze your team's sprint board.
 

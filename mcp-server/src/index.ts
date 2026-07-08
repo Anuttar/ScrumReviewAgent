@@ -760,7 +760,7 @@ server.tool(
 // Tool: Get Work Item Fields
 server.tool(
   'get_work_item_fields',
-  'Get all fields and their values for a given work item. Returns every field reference name and its current value.',
+  'Get all fields and their values for a given work item. Returns a rich structured summary with key attributes, people, dates, description, acceptance criteria, and SARA insights.',
   {
     workItemId: z.number().describe('The ID of the work item to get fields for'),
   },
@@ -770,23 +770,228 @@ server.tool(
 
       if (fields.length === 0) {
         return {
-          content: [{ type: 'text' as const, text: `No fields found for work item #${workItemId}.` }],
+          content: [{ type: 'text' as const, text: `No fields found for work item ${workItemId}.` }],
         };
       }
 
-      let text = `**All Fields for Work Item #${workItemId}** (${fields.length} fields):\n\n`;
-      text += '| Field Name | Reference Name | Value |\n';
-      text += '|------------|----------------|-------|\n';
+      // Build a lookup map
+      const f: Record<string, any> = {};
       for (const field of fields) {
-        let displayValue = field.value;
-        if (displayValue === null || displayValue === undefined) {
-          displayValue = '';
-        } else if (typeof displayValue === 'object') {
-          displayValue = displayValue.displayName || displayValue.name || JSON.stringify(displayValue);
+        let val = field.value;
+        if (val && typeof val === 'object') {
+          val = val.displayName || val.name || JSON.stringify(val);
         }
-        const escaped = String(displayValue).replace(/\|/g, '\\|').replace(/\n/g, ' ');
-        text += `| ${field.name} | ${field.referenceName} | ${escaped} |\n`;
+        f[field.referenceName] = val ?? '';
       }
+
+      const title = f['System.Title'] || 'Untitled';
+      const workItemType = f['System.WorkItemType'] || 'Work Item';
+      const state = f['System.State'] || '';
+      const reason = f['System.Reason'] || '';
+      const assignedTo = f['System.AssignedTo'] || 'Unassigned';
+      const createdBy = f['System.CreatedBy'] || '';
+      const changedBy = f['System.ChangedBy'] || '';
+      const activatedBy = f['Microsoft.VSTS.Common.ActivatedBy'] || '';
+      const priority = f['Microsoft.VSTS.Common.Priority'] || '';
+      const storyPoints = f['Microsoft.VSTS.Scheduling.StoryPoints'] || '';
+      const effort = f['Microsoft.VSTS.Scheduling.Effort'] || '';
+      const originalEstimate = f['Microsoft.VSTS.Scheduling.OriginalEstimate'] || '';
+      const remainingWork = f['Microsoft.VSTS.Scheduling.RemainingWork'] || '';
+      const areaPath = f['System.AreaPath'] || '';
+      const iterationPath = f['System.IterationPath'] || '';
+      const teamProject = f['System.TeamProject'] || '';
+      const boardColumn = f['System.BoardColumn'] || '';
+      const boardLane = f['System.BoardLane'] || '';
+      const tags = f['System.Tags'] || '';
+      const description = f['System.Description'] || '';
+      const acceptanceCriteria = f['Microsoft.VSTS.Common.AcceptanceCriteria'] || '';
+      const commentCount = f['System.CommentCount'] || 0;
+      const parent = f['System.Parent'] || '';
+      const valueArea = f['Microsoft.VSTS.Common.ValueArea'] || '';
+      const rev = f['System.Rev'] || '';
+
+      const createdDate = f['System.CreatedDate'] || '';
+      const changedDate = f['System.ChangedDate'] || '';
+      const stateChangeDate = f['Microsoft.VSTS.Common.StateChangeDate'] || '';
+      const activatedDate = f['Microsoft.VSTS.Common.ActivatedDate'] || '';
+      const waitingSince = f['Custom.WaitingSince'] || '';
+
+      const formatDate = (d: string) => d ? d.substring(0, 10) : 'N/A';
+
+      // State icon
+      const stateIcon = state === 'Active' ? '🟢' : state === 'Resolved' ? '🔵' : state === 'Closed' ? '⚫' : state === 'New' ? '⚪' : '🟡';
+
+      // HTML to Markdown helper
+      const htmlToMarkdown = (html: string) => {
+        let md = html;
+        // Replace <br> and <br/> with newlines
+        md = md.replace(/<br\s*\/?>/gi, '\n');
+        // Replace </p><p> with double newline
+        md = md.replace(/<\/p>\s*<p[^>]*>/gi, '\n\n');
+        // Replace <p> and </p>
+        md = md.replace(/<p[^>]*>/gi, '');
+        md = md.replace(/<\/p>/gi, '\n\n');
+        // Replace <strong> and <b> with markdown bold
+        md = md.replace(/<(strong|b)>/gi, '**');
+        md = md.replace(/<\/(strong|b)>/gi, '**');
+        // Replace <em> and <i> with markdown italic
+        md = md.replace(/<(em|i)>/gi, '*');
+        md = md.replace(/<\/(em|i)>/gi, '*');
+        // Replace <li> with bullet points
+        md = md.replace(/<li[^>]*>/gi, '- ');
+        md = md.replace(/<\/li>/gi, '\n');
+        // Remove <ul>, <ol>, and other container tags
+        md = md.replace(/<\/?(ul|ol|div|span|table|tr|td|th|thead|tbody)[^>]*>/gi, '');
+        // Remove images
+        md = md.replace(/<img[^>]*>/gi, '');
+        // Remove remaining HTML tags
+        md = md.replace(/<[^>]*>/g, '');
+        // Replace HTML entities
+        md = md.replace(/&nbsp;/g, ' ');
+        md = md.replace(/&amp;/g, '&');
+        md = md.replace(/&lt;/g, '<');
+        md = md.replace(/&gt;/g, '>');
+        md = md.replace(/&quot;/g, '"');
+        // Clean up extra whitespace but preserve intentional newlines
+        md = md.replace(/[ \t]+/g, ' ');
+        md = md.replace(/\n /g, '\n');
+        md = md.replace(/\n{3,}/g, '\n\n');
+        return md.trim();
+      };
+
+      // Format acceptance criteria as bullet list
+      const formatAcceptanceCriteria = (html: string) => {
+        const text = htmlToMarkdown(html);
+        // Try to detect AC patterns like "AC1:", "AC2:", etc.
+        const acPattern = /\b(AC\s*\d+)\s*:/gi;
+        if (acPattern.test(text)) {
+          // Split on AC patterns and format as bullets
+          const parts = text.split(/\b(AC\s*\d+)\s*:/i);
+          let result = '';
+          for (let i = 1; i < parts.length; i += 2) {
+            const label = parts[i].replace(/\s+/g, '');
+            const content = (parts[i + 1] || '').trim();
+            result += `- **${label}:** ${content}\n`;
+          }
+          return result.trim();
+        }
+        return text;
+      };
+
+      const orgUrl = process.env.AZURE_DEVOPS_ORG_URL || 'https://dev.azure.com/SHS-CT-ProcessTooling';
+      const url = `${orgUrl}/_apis/wit/workItems/${workItemId}`;
+
+      let text = '';
+
+      // Header
+      text += `# **📋 ${workItemType} ${workItemId} – Details**\n\n`;
+      text += `## **🏷️ Title**\n`;
+      text += `**${title}**\n\n`;
+      text += `🔗 [Open in Azure DevOps](${url})\n\n`;
+      text += `---\n\n`;
+
+      // Key Attributes
+      text += `## **🔑 Key Attributes**\n\n`;
+      text += `| Field | Value |\n`;
+      text += `|-------|-------|\n`;
+      text += `| **ID** | ${workItemId} |\n`;
+      text += `| **Type** | ${workItemType} |\n`;
+      text += `| **State** | ${stateIcon} ${state} |\n`;
+      text += `| **Reason** | ${reason} |\n`;
+      if (boardColumn) text += `| **Board Column** | ⏳ ${boardColumn} |\n`;
+      if (boardLane) text += `| **Board Lane** | ${boardLane} |\n`;
+      text += `| **Priority** | ${priority} |\n`;
+      if (valueArea) text += `| **Value Area** | ${valueArea} |\n`;
+      if (storyPoints) text += `| **Story Points** | ${storyPoints} |\n`;
+      const effortLine = [effort, originalEstimate, remainingWork].filter(Boolean).join(' / ');
+      if (effortLine) text += `| **Effort / Original Estimate / Remaining Work** | ${effortLine} |\n`;
+      text += `| **Revision** | ${rev} |\n`;
+      text += `\n---\n\n`;
+
+      // People
+      text += `## **👥 People**\n\n`;
+      text += `| Role | Name |\n`;
+      text += `|------|------|\n`;
+      if (createdBy) text += `| **Created By** | ${createdBy} |\n`;
+      text += `| **Assigned To** | ${assignedTo} |\n`;
+      if (activatedBy) text += `| **Activated By** | ${activatedBy} |\n`;
+      if (changedBy) text += `| **Last Changed By** | ${changedBy} |\n`;
+      if (parent) text += `| **Parent Work Item** | ${parent} |\n`;
+      text += `\n---\n\n`;
+
+      // Dates
+      text += `## **🗓️ Dates**\n\n`;
+      text += `| Event | Date (UTC) |\n`;
+      text += `|-------|------------|\n`;
+      text += `| **Created** | ${formatDate(createdDate)} |\n`;
+      if (activatedDate) text += `| **Activated** | ${formatDate(activatedDate)} |\n`;
+      if (stateChangeDate) text += `| **State Change** | ${formatDate(stateChangeDate)} |\n`;
+      if (waitingSince) text += `| **Waiting Since** | ${formatDate(waitingSince)} |\n`;
+      text += `| **Last Changed** | ${formatDate(changedDate)} |\n`;
+      text += `\n---\n\n`;
+
+      // Classification
+      text += `## **📂 Classification**\n\n`;
+      text += `- **Area Path:** \`${areaPath.replace(/\\/g, ' \\ ')}\`\n`;
+      text += `- **Iteration Path:** \`${iterationPath.replace(/\\/g, ' \\ ')}\`\n`;
+      text += `- **Team Project:** ${teamProject}\n`;
+      text += `\n---\n\n`;
+
+      // Tags
+      if (tags) {
+        const tagList = tags.split(';').map((t: string) => `\`${t.trim()}\``).join(' · ');
+        text += `## **🏷️ Tags**\n${tagList}\n\n---\n\n`;
+      }
+
+      // Description
+      if (description) {
+        text += `## **📝 Description**\n${htmlToMarkdown(description)}\n\n---\n\n`;
+      }
+
+      // Acceptance Criteria
+      if (acceptanceCriteria) {
+        text += `## **✅ Acceptance Criteria**\n\n${formatAcceptanceCriteria(acceptanceCriteria)}\n\n---\n\n`;
+      }
+
+      // Comments
+      if (commentCount) {
+        text += `## **💬 Comments**\nThere are **${commentCount} comments** on this work item. Let me know if you'd like me to fetch them.\n\n---\n\n`;
+      }
+
+      // SARA Insights
+      text += `## **⚠️ Observations (SARA Insights)**\n\n`;
+      const insights: string[] = [];
+
+      // Check for blocked tag
+      const tagLower = tags.toLowerCase();
+      if (tagLower.includes('blocked')) {
+        insights.push(`🚩 **Blocked${waitingSince ? ` & Waiting since ${formatDate(waitingSince)}` : ''}** — item has been in a waiting/blocked state for a prolonged period; consider escalation or a dependency check.`);
+      }
+
+      // Check for carry-over (multiple sprint tags)
+      const sprintTags = tags.split(';').map((t: string) => t.trim()).filter((t: string) => /^\d{4}_\d{2}$/.test(t));
+      if (sprintTags.length > 3) {
+        insights.push(`🔁 **Tagged across ${sprintTags.length} sprints (${sprintTags[0]} → ${sprintTags[sprintTags.length - 1]})** — indicates recurring carry-over; recommend a root-cause review in the next retrospective.`);
+      }
+
+      // Check for low effort + long cycle time
+      const sp = Number(storyPoints) || Number(effort) || 0;
+      if (sp > 0 && sp <= 2 && createdDate) {
+        const ageDays = Math.floor((Date.now() - new Date(createdDate).getTime()) / (1000 * 60 * 60 * 24));
+        if (ageDays > 60) {
+          insights.push(`📌 Low effort (${sp} SP) but long cycle time — suggests the blocker is **external dependency**, not implementation complexity.`);
+        }
+      }
+
+      if (insights.length === 0) {
+        insights.push(`✅ No significant concerns detected. Item appears healthy.`);
+      }
+
+      for (const insight of insights) {
+        text += `- ${insight}\n`;
+      }
+
+      text += `\nWould you like me to also pull the **comments**, **linked items**, or **parent Feature (${parent})** details?`;
 
       return {
         content: [{ type: 'text' as const, text }],

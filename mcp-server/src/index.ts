@@ -5,7 +5,10 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
 import fetch from 'node-fetch';
+import sharp from 'sharp';
 import { AzureDevOpsClient, AzureDevOpsConfig } from './azure-devops-client.js';
 import { getAuthStatus, logout, triggerLogin } from './sharepoint/auth.js';
 import {
@@ -100,6 +103,242 @@ server.tool(
             text: JSON.stringify(workItems, null, 2),
           },
         ],
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Sprint Burndown
+server.tool(
+  'get_sprint_burndown',
+  'Create sprint burndown chart with Monday-Friday working-day ideal burn and development burn trajectories. Returns an annotated SVG line chart, day-by-day data grid, and statistics.',
+  {
+    iterationId: z.string().optional().describe('Sprint iteration ID. If not provided, uses current sprint.'),
+    queryDate: z.string().optional().describe('Date to highlight in YYYY-MM-DD format. If not provided, uses today.'),
+    includeChart: z.boolean().default(true).describe('If true, includes an SVG burndown chart in the output.'),
+  },
+  async ({ iterationId, queryDate, includeChart }) => {
+    try {
+      const burndown = await client.getSprintBurndown(iterationId, queryDate);
+
+      const maxValue = Math.max(
+        1,
+        ...burndown.points.map((p) => Math.max(p.scope, p.developmentRemaining, p.idealRemaining, p.teamTargetRemaining))
+      );
+      const yAxisMax = Math.ceil(maxValue * 1.1);
+
+      const queryPoint = burndown.points.find((p) => p.isQueryDate) || burndown.points[burndown.points.length - 1];
+      const idealAtQuery = queryPoint ? queryPoint.idealRemaining : 0;
+      const remainingAtQuery = queryPoint ? queryPoint.developmentRemaining : 0;
+      const varianceAtQuery = Math.round((remainingAtQuery - idealAtQuery) * 100) / 100;
+      const paceStatus = varianceAtQuery > 0 ? 'Behind ideal pace' : varianceAtQuery < 0 ? 'Ahead of ideal pace' : 'On ideal pace';
+      const workingDaysLeft = Math.max(burndown.totalDays - (queryPoint?.dayIndex || burndown.totalDays), 0);
+      const requiredDailyBurn = workingDaysLeft > 0 ? Math.round((remainingAtQuery / workingDaysLeft) * 100) / 100 : remainingAtQuery;
+
+      const gridTable = burndown.points
+        .map((p) => {
+          const marker = p.isQueryDate ? ' <== TODAY' : '';
+          return `| D${p.dayIndex} | ${p.dayLabel.replace(`Day ${p.dayIndex} `, '')} | ${p.idealRemaining} | ${p.developmentRemaining} | ${p.teamTargetRemaining}${marker} |`;
+        })
+        .join('\n');
+
+      // ─── SVG Annotated Burndown Chart ──────────────────────────────────────
+      let svgChart: string | undefined;
+      if (includeChart) {
+        const points = burndown.points;
+        const n = points.length;
+
+        // Chart dimensions
+        const margin = { top: 60, right: 30, bottom: 120, left: 70 };
+        const width = 900;
+        const height = 500;
+        const plotW = width - margin.left - margin.right;
+        const plotH = height - margin.top - margin.bottom;
+
+        // Scales
+        const xScale = (i: number) => margin.left + (i / Math.max(n - 1, 1)) * plotW;
+        const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+
+        // Build polyline strings
+        const idealPolyline = points.map((p, i) => `${xScale(i)},${yScale(p.idealRemaining)}`).join(' ');
+        const actualPolyline = points.map((p, i) => `${xScale(i)},${yScale(p.teamTargetRemaining)}`).join(' ');
+
+        // Dots
+        const idealDots = points.map((p, i) => `<circle cx="${xScale(i)}" cy="${yScale(p.idealRemaining)}" r="4" fill="#1f77b4"/>`).join('');
+        const actualDots = points.map((p, i) => `<circle cx="${xScale(i)}" cy="${yScale(p.teamTargetRemaining)}" r="4" fill="#d62728"/>`).join('');
+
+        // Grid lines (horizontal)
+        const yTicks = 6;
+        let gridLines = '';
+        for (let t = 0; t <= yTicks; t++) {
+          const val = Math.round((yAxisMax / yTicks) * t * 10) / 10;
+          const y = yScale(val);
+          gridLines += `<line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" stroke="#e0e0e0" stroke-width="0.5"/>`;
+          gridLines += `<text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" font-size="10" fill="#333">${val}</text>`;
+        }
+
+        // X-axis labels (rotated)
+        const xLabels = points.map((p, i) => {
+          const x = xScale(i);
+          const label = `Day ${p.dayIndex} (${p.date.slice(5).replace('-', '/')})`;
+          return `<text x="${x}" y="${margin.top + plotH + 14}" text-anchor="end" font-size="9" fill="#333" transform="rotate(-45 ${x} ${margin.top + plotH + 14})">${label}</text>`;
+        }).join('');
+
+        // Today vertical dashed line
+        const queryIdx = points.findIndex((p) => p.isQueryDate);
+        let todayLine = '';
+        if (queryIdx >= 0) {
+          const tx = xScale(queryIdx);
+          todayLine = `<line x1="${tx}" y1="${margin.top}" x2="${tx}" y2="${margin.top + plotH}" stroke="#555" stroke-width="1.2" stroke-dasharray="6,3"/>`;
+          todayLine += `<text x="${tx + 4}" y="${margin.top - 5}" font-size="9" fill="#555" transform="rotate(-90 ${tx + 4} ${margin.top - 5})">Today (${points[queryIdx].date})</text>`;
+        }
+
+        // Scope horizontal dashed line
+        const scopeY = yScale(burndown.totalScope);
+        const scopeLine = `<line x1="${margin.left}" y1="${scopeY}" x2="${width - margin.right}" y2="${scopeY}" stroke="#999" stroke-width="1" stroke-dasharray="4,4"/>`;
+        const scopeLabel = `<text x="${width - margin.right + 4}" y="${scopeY + 4}" font-size="9" fill="#999">Scope (${burndown.totalScope})</text>`;
+
+        // Sprint start annotation
+        const startAnnotation = `<text x="${xScale(0) + 4}" y="${yScale(points[0].idealRemaining) - 10}" font-size="9" fill="#1f77b4" font-style="italic">Sprint Start</text>`;
+        // End annotation
+        const endAnnotation = `<text x="${xScale(n - 1) + 4}" y="${yScale(0) + 4}" font-size="9" fill="#d62728" font-weight="bold">End</text>`;
+
+        // Legend
+        const legendX = width - margin.right - 180;
+        const legendY = margin.top + 10;
+        const legend = `
+          <rect x="${legendX}" y="${legendY}" width="175" height="60" fill="white" stroke="#ccc" rx="4"/>
+          <line x1="${legendX + 10}" y1="${legendY + 16}" x2="${legendX + 30}" y2="${legendY + 16}" stroke="#1f77b4" stroke-width="2"/>
+          <circle cx="${legendX + 20}" cy="${legendY + 16}" r="3" fill="#1f77b4"/>
+          <text x="${legendX + 36}" y="${legendY + 20}" font-size="10" fill="#333">Ideal Burndown</text>
+          <line x1="${legendX + 10}" y1="${legendY + 34}" x2="${legendX + 30}" y2="${legendY + 34}" stroke="#d62728" stroke-width="2"/>
+          <circle cx="${legendX + 20}" cy="${legendY + 34}" r="3" fill="#d62728"/>
+          <text x="${legendX + 36}" y="${legendY + 38}" font-size="10" fill="#333">Actual Burndown</text>
+          <line x1="${legendX + 10}" y1="${legendY + 52}" x2="${legendX + 30}" y2="${legendY + 52}" stroke="#999" stroke-width="1" stroke-dasharray="4,4"/>
+          <text x="${legendX + 36}" y="${legendY + 56}" font-size="10" fill="#333">Scope (${burndown.totalScope})</text>`;
+
+        // Stats annotation box
+        const statsBoxX = width - margin.right - 260;
+        const statsBoxY = margin.top + plotH - 90;
+        const statsLines = [
+          `Burndown as of Day ${queryPoint?.dayIndex} (${queryPoint?.date}):`,
+          `  Remaining Work: ${remainingAtQuery} story points`,
+          `  Initial Scope: ${burndown.startScope} story points`,
+          `  Working Days Left: ${workingDaysLeft}`,
+          `  Ideal Remaining (Day ${queryPoint?.dayIndex}): ${idealAtQuery} SP`,
+          `  Required Daily Burn: ${requiredDailyBurn} SP/day`,
+        ];
+        const statsText = statsLines.map((line, i) =>
+          `<text x="${statsBoxX + 8}" y="${statsBoxY + 14 + i * 13}" font-size="9" fill="#333" font-family="monospace">${line}</text>`
+        ).join('');
+        const statsBox = `<rect x="${statsBoxX}" y="${statsBoxY}" width="255" height="${statsLines.length * 13 + 10}" fill="white" stroke="#aaa" rx="3" opacity="0.92"/>${statsText}`;
+
+        // Title
+        const sprintStart = burndown.sprint.startDate.slice(0, 10);
+        const sprintFinish = burndown.sprint.finishDate.slice(0, 10);
+        const title = `${burndown.sprint.name} Burndown Chart — Avengers Team (${sprintStart} – ${sprintFinish})`;
+        const titleEl = `<text x="${width / 2}" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">${title}</text>`;
+
+        // Y-axis label
+        const yLabel = `<text x="14" y="${margin.top + plotH / 2}" text-anchor="middle" font-size="11" fill="#333" transform="rotate(-90 14 ${margin.top + plotH / 2})">Remaining Work (story points)</text>`;
+        // X-axis label
+        const xLabel = `<text x="${margin.left + plotW / 2}" y="${height - 5}" text-anchor="middle" font-size="11" fill="#333">Working Day (and Date)</text>`;
+
+        svgChart = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="font-family:Arial,sans-serif;">
+<rect x="0" y="0" width="${width}" height="${height}" fill="white"/>
+${titleEl}
+${yLabel}
+${xLabel}
+<!-- Grid -->
+${gridLines}
+<!-- Axes -->
+<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + plotH}" stroke="#333" stroke-width="1"/>
+<line x1="${margin.left}" y1="${margin.top + plotH}" x2="${width - margin.right}" y2="${margin.top + plotH}" stroke="#333" stroke-width="1"/>
+<!-- Scope line -->
+${scopeLine}${scopeLabel}
+<!-- Ideal line -->
+<polyline points="${idealPolyline}" fill="none" stroke="#1f77b4" stroke-width="2"/>
+${idealDots}
+<!-- Actual line -->
+<polyline points="${actualPolyline}" fill="none" stroke="#d62728" stroke-width="2"/>
+${actualDots}
+<!-- Today marker -->
+${todayLine}
+<!-- Annotations -->
+${startAnnotation}
+${endAnnotation}
+<!-- X labels -->
+${xLabels}
+<!-- Legend -->
+${legend}
+<!-- Stats box -->
+${statsBox}
+</svg>`;
+      }
+
+      // Build summary text
+      const summaryText = [
+        `## Sprint Burndown — ${burndown.sprint.name} (Avengers)`,
+        `**Sprint Window:** ${burndown.sprint.startDate.slice(0, 10)} to ${burndown.sprint.finishDate.slice(0, 10)}`,
+        `**Working Days:** ${burndown.totalDays} total | ${workingDaysLeft} remaining`,
+        `**Report Date:** ${burndown.queryDate} (Day ${queryPoint?.dayIndex})`,
+        ``,
+        `| Metric | Value |`,
+        `|--------|-------|`,
+        `| Initial Scope | ${burndown.startScope} SP |`,
+        `| Total Scope | ${burndown.totalScope} SP |`,
+        `| Completed | ${burndown.completedScope} SP |`,
+        `| Remaining | ${burndown.currentRemaining} SP |`,
+        `| Ideal Remaining (Day ${queryPoint?.dayIndex}) | ${idealAtQuery} SP |`,
+        `| Gap vs Ideal | ${varianceAtQuery > 0 ? '+' : ''}${varianceAtQuery} SP |`,
+        `| Pace Status | ${paceStatus} |`,
+        `| Required Daily Burn | ${requiredDailyBurn} SP/day |`,
+        ``,
+        `### Day-by-Day Grid`,
+        `| Day | Working Day | Ideal Remaining | Development Remaining | Team Target Remaining |`,
+        `|---|---|---:|---:|---:|`,
+        gridTable,
+      ].join('\n');
+
+      // Return image + text content blocks
+      const contentBlocks: { type: string; text?: string; data?: string; mimeType?: string }[] = [];
+
+      let chartTempPath: string | undefined;
+
+      if (svgChart) {
+        // Convert SVG → PNG (Outlook supports PNG; not SVG)
+        const pngBuffer = await sharp(Buffer.from(svgChart, 'utf-8'))
+          .png()
+          .toBuffer();
+        const pngBase64 = pngBuffer.toString('base64');
+
+        // Save to temp file so draft_sprint_email can embed it
+        chartTempPath = path.join(os.tmpdir(), 'sprint_burndown_chart.png');
+        fs.writeFileSync(chartTempPath, pngBuffer);
+
+        contentBlocks.push({
+          type: 'image' as const,
+          data: pngBase64,
+          mimeType: 'image/png',
+        });
+      }
+
+      const summaryWithChartPath = chartTempPath
+        ? summaryText + `\n\n> **Chart saved to:** \`${chartTempPath}\` — pass this path as \`chartImagePath\` to \`draft_sprint_email\` to embed the chart visually in Outlook.`
+        : summaryText;
+
+      contentBlocks.push({
+        type: 'text' as const,
+        text: summaryWithChartPath,
+      });
+
+      return {
+        content: contentBlocks as any,
       };
     } catch (error: any) {
       return {
@@ -310,10 +549,32 @@ server.tool(
     subject: z.string().describe('Email subject line, e.g. "Sprint 14 Review - PDS_Avengers"'),
     body: z.string().describe('The full sprint analysis content in HTML format. Use HTML tables, headings, and formatting.'),
     to: z.string().optional().describe('Recipient email addresses, semicolon-separated. Leave empty to add recipients manually.'),
+    chartImagePath: z.string().optional().describe('Absolute path to a PNG chart image (returned by get_sprint_burndown). When provided, embeds the burndown chart visually in the email.'),
   },
-  async ({ subject, body, to }) => {
+  async ({ subject, body, to, chartImagePath }) => {
     try {
       const scriptPath = path.resolve(__dirname, '..', 'scripts', 'create-outlook-draft.ps1');
+
+      // Optionally embed burndown chart PNG
+      let chartImgTag = '';
+      if (chartImagePath && fs.existsSync(chartImagePath)) {
+        const pngData = fs.readFileSync(chartImagePath);
+        const pngBase64 = pngData.toString('base64');
+        chartImgTag = `<div style="margin:16px 0;"><img src="data:image/png;base64,${pngBase64}" width="860" style="max-width:100%;border:1px solid #dce3ef;border-radius:4px;display:block;"/></div>`;
+      }
+
+      // Inject chart after first <h3> or at the start of body if no heading found
+      let bodyWithChart = body;
+      if (chartImgTag) {
+        // Insert chart right after the first </h2> or </h3>, or prepend
+        const insertAfter = body.match(/<\/h[23]>/i);
+        if (insertAfter && insertAfter.index !== undefined) {
+          const insertIdx = insertAfter.index + insertAfter[0].length;
+          bodyWithChart = body.slice(0, insertIdx) + chartImgTag + body.slice(insertIdx);
+        } else {
+          bodyWithChart = chartImgTag + body;
+        }
+      }
 
       // Wrap the body in a styled HTML template
       const htmlBody = `
@@ -334,7 +595,7 @@ server.tool(
 </style>
 </head>
 <body>
-${body}
+${bodyWithChart}
 <br/><hr/>
 <p style="font-size:9pt;color:#888;">Generated by Sprint Review Analyst Agent on ${new Date().toLocaleDateString()}</p>
 </body>

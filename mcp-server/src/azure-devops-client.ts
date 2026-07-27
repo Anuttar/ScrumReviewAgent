@@ -31,6 +31,32 @@ export interface SprintInfo {
   timeFrame: string;
 }
 
+export interface SprintBurndownPoint {
+  dayIndex: number;
+  dayLabel: string;
+  date: string;
+  scope: number;
+  completed: number;
+  remaining: number;
+  developmentRemaining: number;
+  teamTargetRemaining: number;
+  idealRemaining: number;
+  isQueryDate: boolean;
+}
+
+export interface SprintBurndown {
+  sprint: SprintInfo;
+  unit: 'storyPoints';
+  schedule: 'workingDays';
+  queryDate: string;
+  totalScope: number;
+  startScope: number;
+  completedScope: number;
+  currentRemaining: number;
+  totalDays: number;
+  points: SprintBurndownPoint[];
+}
+
 export interface TeamMemberCapacity {
   teamMember: string;
   activities: { name: string; capacityPerDay: number }[];
@@ -115,6 +141,17 @@ export class AzureDevOpsClient {
     return response.json() as Promise<T>;
   }
 
+  private normalizeSprint(raw: any): SprintInfo {
+    return {
+      id: raw.id,
+      name: raw.name,
+      path: raw.path,
+      startDate: raw.startDate || raw.attributes?.startDate || '',
+      finishDate: raw.finishDate || raw.attributes?.finishDate || '',
+      timeFrame: raw.timeFrame || raw.attributes?.timeFrame || '',
+    };
+  }
+
   async getTeamId(): Promise<string> {
     // Resolve team name to team ID (GUID) using the Teams API
     const url = `${this.config.orgUrl}/_apis/projects/${this.config.project}/teams/${encodeURIComponent(this.config.team)}?api-version=7.0`;
@@ -124,19 +161,19 @@ export class AzureDevOpsClient {
 
   async getCurrentSprint(): Promise<SprintInfo> {
     const url = `${this.baseUrl}/_apis/work/teamsettings/iterations?$timeframe=current&api-version=7.0`;
-    const result = await this.request<{ value: SprintInfo[] }>(url);
+    const result = await this.request<{ value: any[] }>(url);
 
     if (!result.value || result.value.length === 0) {
       throw new Error('No current sprint found');
     }
 
-    return result.value[0];
+    return this.normalizeSprint(result.value[0]);
   }
 
   async getIterations(): Promise<SprintInfo[]> {
     const url = `${this.baseUrl}/_apis/work/teamsettings/iterations?api-version=7.0`;
-    const result = await this.request<{ value: SprintInfo[] }>(url);
-    return result.value || [];
+    const result = await this.request<{ value: any[] }>(url);
+    return (result.value || []).map((iteration) => this.normalizeSprint(iteration));
   }
 
   async getSprintWorkItems(iterationId: string): Promise<WorkItem[]> {
@@ -255,6 +292,224 @@ export class AzureDevOpsClient {
     }
 
     return carryovers;
+  }
+
+  async getSprintBurndown(iterationId?: string, queryDateInput?: string): Promise<SprintBurndown> {
+    const doneStates = new Set(['Done', 'Closed', 'Resolved']);
+
+    const toUtcDate = (value: string): Date => {
+      const d = new Date(value);
+      return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+    };
+
+    const addUtcDays = (date: Date, days: number): Date => {
+      const result = new Date(date);
+      result.setUTCDate(result.getUTCDate() + days);
+      return result;
+    };
+
+    const isWorkingDay = (date: Date): boolean => {
+      const day = date.getUTCDay();
+      return day >= 1 && day <= 5;
+    };
+
+    const toIsoDay = (date: Date): string => date.toISOString().slice(0, 10);
+    const toLabelDay = (date: Date): string =>
+      date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+    const round2 = (value: number): number => Math.round(value * 100) / 100;
+
+    const sprint = iterationId
+      ? (await this.getIterations()).find((i) => i.id === iterationId)
+      : await this.getCurrentSprint();
+
+    if (!sprint) {
+      throw new Error(`Sprint iteration not found for id: ${iterationId}`);
+    }
+
+    if (!sprint.startDate || !sprint.finishDate) {
+      throw new Error(`Sprint ${sprint.name} does not have valid start/finish dates.`);
+    }
+
+    const sprintStart = toUtcDate(sprint.startDate);
+    const sprintFinish = toUtcDate(sprint.finishDate);
+
+    if (sprintFinish < sprintStart) {
+      throw new Error(`Sprint ${sprint.name} has finish date before start date.`);
+    }
+
+    const allItems = await this.getSprintWorkItems(sprint.id);
+    const scopedItems = allItems.filter(
+      (item) =>
+        (item.workItemType === 'User Story' || item.workItemType === 'Product Backlog Item' || item.workItemType === 'Bug') &&
+        (item.storyPoints || 0) > 0
+    );
+
+    const snapshots = await Promise.all(
+      scopedItems.map(async (item) => {
+        const points = item.storyPoints || 0;
+        let addedDate = item.createdDate ? toUtcDate(item.createdDate) : sprintStart;
+        if (addedDate < sprintStart) {
+          addedDate = sprintStart;
+        }
+
+        try {
+          const updates = await this.request<{ value: any[] }>(
+            `${this.projectUrl}/_apis/wit/workitems/${item.id}/updates?api-version=7.0`
+          );
+
+          const enteredDoneDates: Date[] = [];
+
+          for (const update of updates.value || []) {
+            const revisedDate = update.revisedDate ? toUtcDate(update.revisedDate) : null;
+            if (!revisedDate) {
+              continue;
+            }
+
+            const iterationField = update.fields?.['System.IterationPath'];
+            if (iterationField?.newValue === sprint.path && revisedDate > addedDate) {
+              addedDate = revisedDate;
+            }
+
+            const stateField = update.fields?.['System.State'];
+            const newState = stateField?.newValue;
+            if (newState && doneStates.has(newState)) {
+              enteredDoneDates.push(revisedDate);
+            }
+          }
+
+          let completionDate: Date | null = null;
+          if (doneStates.has(item.state)) {
+            if (enteredDoneDates.length > 0) {
+              completionDate = enteredDoneDates.sort((a, b) => a.getTime() - b.getTime())[0];
+            } else if (item.changedDate) {
+              completionDate = toUtcDate(item.changedDate);
+            }
+          }
+
+          return {
+            id: item.id,
+            points,
+            addedDate,
+            completionDate,
+          };
+        } catch {
+          // Fall back to the current item snapshot if update history is unavailable.
+          const fallbackCompletion = doneStates.has(item.state) && item.changedDate ? toUtcDate(item.changedDate) : null;
+          return {
+            id: item.id,
+            points,
+            addedDate,
+            completionDate: fallbackCompletion,
+          };
+        }
+      })
+    );
+
+    const totalDays = Math.max(
+      1,
+      Math.floor((sprintFinish.getTime() - sprintStart.getTime()) / (1000 * 60 * 60 * 24)) + 1
+    );
+
+    const calendarDates: Date[] = [];
+    for (let i = 0; i < totalDays; i++) {
+      calendarDates.push(addUtcDays(sprintStart, i));
+    }
+
+    const dates = calendarDates.filter(isWorkingDay);
+    if (dates.length === 0) {
+      dates.push(sprintStart);
+    }
+
+    const workingDays = dates.length;
+
+    const queryDateRaw = queryDateInput ? toUtcDate(queryDateInput) : toUtcDate(new Date().toISOString());
+    const clampedQueryDate = queryDateRaw < dates[0]
+      ? dates[0]
+      : queryDateRaw > dates[dates.length - 1]
+      ? dates[dates.length - 1]
+      : queryDateRaw;
+
+    let queryWorkingIndex = dates.findIndex((d) => d.getTime() === clampedQueryDate.getTime());
+    if (queryWorkingIndex === -1) {
+      queryWorkingIndex = dates.findIndex((d) => d > clampedQueryDate);
+      if (queryWorkingIndex === -1) {
+        queryWorkingIndex = dates.length - 1;
+      }
+    }
+
+    const startScope = round2(
+      snapshots
+        .filter((s) => s.addedDate <= sprintStart)
+        .reduce((sum, s) => sum + s.points, 0)
+    );
+
+    const totalScope = round2(
+      snapshots
+        .filter((s) => s.addedDate <= sprintFinish)
+        .reduce((sum, s) => sum + s.points, 0)
+    );
+
+    const idealBaseline = startScope > 0 ? startScope : totalScope;
+
+    const points: SprintBurndownPoint[] = dates.map((day, index) => {
+      const scope = round2(
+        snapshots
+          .filter((s) => s.addedDate <= day)
+          .reduce((sum, s) => sum + s.points, 0)
+      );
+
+      const completed = round2(
+        snapshots
+          .filter((s) => !!s.completionDate && s.completionDate <= day)
+          .reduce((sum, s) => sum + s.points, 0)
+      );
+
+      const remaining = round2(Math.max(scope - completed, 0));
+      const progressRatio = workingDays === 1 ? 1 : index / (workingDays - 1);
+      const idealRemaining = round2(Math.max(idealBaseline * (1 - progressRatio), 0));
+
+      return {
+        dayIndex: index + 1,
+        dayLabel: `Day ${index + 1} (${toLabelDay(day)})`,
+        date: toIsoDay(day),
+        scope,
+        completed,
+        remaining,
+        developmentRemaining: remaining,
+        teamTargetRemaining: 0,
+        idealRemaining,
+        isQueryDate: index === queryWorkingIndex,
+      };
+    });
+
+    const queryPoint = points[queryWorkingIndex] || points[points.length - 1];
+    const remainingDaysAfterQuery = Math.max(points.length - 1 - queryWorkingIndex, 0);
+    for (let i = 0; i < points.length; i++) {
+      if (i <= queryWorkingIndex) {
+        points[i].teamTargetRemaining = points[i].developmentRemaining;
+      } else if (remainingDaysAfterQuery === 0) {
+        points[i].teamTargetRemaining = points[i].developmentRemaining;
+      } else {
+        const ratio = (i - queryWorkingIndex) / remainingDaysAfterQuery;
+        points[i].teamTargetRemaining = round2(Math.max(queryPoint.developmentRemaining * (1 - ratio), 0));
+      }
+    }
+
+    const completedScope = points.length > 0 ? points[points.length - 1].completed : 0;
+    const currentRemaining = points.length > 0 ? points[points.length - 1].remaining : 0;
+
+    return {
+      sprint,
+      unit: 'storyPoints',
+      schedule: 'workingDays',
+      queryDate: queryPoint.date,
+      totalScope,
+      startScope: round2(idealBaseline),
+      completedScope: round2(completedScope),
+      currentRemaining: round2(currentRemaining),
+      totalDays: workingDays,
+      points,
+    };
   }
 
   async queryWorkItems(query: string): Promise<WorkItem[]> {

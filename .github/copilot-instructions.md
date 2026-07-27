@@ -80,15 +80,27 @@ When asked about sprint health, sprint planning analysis, or sprint status, alwa
 - Use bullet points with # prefix for work item IDs
 
 ## Section 4: 📈 Sprint Burndown Snapshot
-- Present as a table with these metrics:
+- **Always** call `get_sprint_burndown` (with `includeChart: true`) to generate the annotated PNG burndown chart.
+- The tool returns an `image/png` content block — this renders visually in chat. Include it inline in the response.
+- The response text also contains a line like: `> **Chart saved to:** \`C:\...\sprint_burndown_chart.png\`` — save this path for use in email drafting.
+- Do NOT embed inline SVG in email bodies — Outlook does not render SVG. Use `chartImagePath` in `draft_sprint_email` instead.
+- Below the chart, present a summary table with these metrics:
   - Sprint Duration (dates and working days)
-  - Initial Scope (person-days)
+  - Initial Scope (story points)
   - Remaining Work (as of current day)
   - Ideal Remaining (for current day)
   - Gap vs. Ideal (with ⚠️ if behind)
   - Working Days Left
   - Required Daily Burn Rate
-- Calculate based on: stories not Done × average effort, days elapsed vs total days
+  - Pace Status (Behind / Ahead / On ideal pace)
+- The chart contains:
+  - Blue line = Ideal Burndown (Mon-Fri)
+  - Red line = Actual Development Burndown (Mon-Fri)
+  - Dashed vertical line = Today marker
+  - Gray dashed horizontal line = Scope
+  - Stats annotation box with key metrics
+  - Legend and rotated day labels
+- Calculate based on: stories not Done × story points, days elapsed vs total working days
 
 ## Section 5: 🚨 Risks & Observations
 - Split into two sub-sections:

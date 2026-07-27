@@ -53,12 +53,17 @@ A 1-10 rating based on completion rate, carryover ratio, and blocked items
 
 When the user asks to draft/email the sprint analysis:
 1. First complete the full sprint analysis
-2. Convert the analysis into well-formatted HTML with tables, headings, and color coding
-3. Use the `draft_sprint_email` tool with:
+2. Call `get_sprint_burndown` (with `includeChart: true`) to obtain the burndown chart. The response text will contain a line like:
+   `> **Chart saved to:** \`C:\Users\...\sprint_burndown_chart.png\``
+   Extract this file path exactly as shown.
+3. Convert the analysis into well-formatted HTML with tables, headings, and color coding.
+   Do NOT embed inline SVG in the email body — Outlook does not render SVG.
+4. Use the `draft_sprint_email` tool with:
    - A clear subject line like "Sprint {N} Review - {Team} - {Date}"
-   - The full analysis as HTML body
+   - The full analysis as HTML body (without SVG — the tool will inject the PNG chart automatically)
+   - `chartImagePath`: the file path extracted from step 2 (e.g. `C:\Users\...\sprint_burndown_chart.png`)
    - Optionally include recipients if the user provides them
-4. Confirm the draft was created and remind user to check Outlook Drafts folder
+5. Confirm the draft was created and remind user to check Outlook Drafts folder
 
 ## Constraints
 

@@ -74,6 +74,7 @@ In VS Code Copilot Chat, select the **Sprint Review Analyst** agent from the age
 |------|-------------|
 | `get_current_sprint` | Fetches the active sprint's name, dates, and timeframe |
 | `get_sprint_work_items` | Retrieves all work items in the sprint (stories, tasks, bugs) |
+| `get_sprint_burndown` | Generates an annotated SVG burndown line chart with Monday-Friday ideal/development trajectories, today marker, legend, stats box, and day-by-day data grid |
 | `get_sprint_history` | Detects carryover stories and flags recurring carryovers |
 | `get_team_capacity` | Gets team member allocation and days off |
 | `get_iterations` | Lists all past, current, and future sprint iterations |

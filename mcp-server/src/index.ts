@@ -7,6 +7,16 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fetch from 'node-fetch';
 import { AzureDevOpsClient, AzureDevOpsConfig } from './azure-devops-client.js';
+import { getAuthStatus, logout, triggerLogin } from './sharepoint/auth.js';
+import {
+  listDocuments,
+  searchDocuments,
+  getDocumentContent,
+  listSites,
+  getListItems,
+  getRecentChanges,
+} from './sharepoint/sharepoint.js';
+import { formatDocumentList, formatListItems, formatSearchResults } from './sharepoint/formatters.js';
 
 const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
@@ -138,27 +148,55 @@ server.tool(
   }
 );
 
-// Tool: Get Team Capacity
+// Tool: Get Team Capacity (from SharePoint)
 server.tool(
   'get_team_capacity',
-  'Get team member capacity and allocation for the current sprint',
+  'Get team member capacity and allocation for the current or specified sprint. Data is fetched from the SharePoint "Team Capacity" folder.',
   {
-    iterationId: z.string().optional().describe('Sprint iteration ID. If not provided, uses current sprint.'),
+    sprintNumber: z.string().optional().describe('Sprint number (e.g. "13", "14"). If not provided, auto-detects from current sprint name.'),
   },
-  async ({ iterationId }) => {
+  async ({ sprintNumber }) => {
     try {
-      let sprintId = iterationId;
-      if (!sprintId) {
-        const currentSprint = await client.getCurrentSprint();
-        sprintId = currentSprint.id;
+      const siteUrl = process.env.SHAREPOINT_SITE_URL;
+      if (!siteUrl) {
+        return { content: [{ type: 'text' as const, text: 'Error: SHAREPOINT_SITE_URL env var is not set.' }], isError: true };
       }
 
-      const capacity = await client.getTeamCapacity(sprintId);
+      // Determine sprint number from current sprint if not provided
+      let targetSprint = sprintNumber;
+      if (!targetSprint) {
+        const currentSprint = await client.getCurrentSprint();
+        // Extract sprint number from sprint name (e.g. "Sprint 14" -> "14")
+        const match = currentSprint.name.match(/(\d+)/);
+        if (match) {
+          targetSprint = match[1];
+        } else {
+          return { content: [{ type: 'text' as const, text: `Error: Could not extract sprint number from "${currentSprint.name}". Please provide sprintNumber explicitly.` }], isError: true };
+        }
+      }
+
+      // List files in Team Capacity folder to find the matching sprint file
+      const capacityFolderPath = 'PDS Team/Agent/Avengers/Team Capacity';
+      const docs = await listDocuments(siteUrl, 'Documents', capacityFolderPath, 50);
+
+      // Find matching file (e.g. "Sprint 13.xlsx")
+      const matchingFile = docs.find(doc =>
+        doc.name.toLowerCase().includes(`sprint ${targetSprint}`) ||
+        doc.name.toLowerCase().includes(`sprint${targetSprint}`)
+      );
+
+      if (!matchingFile) {
+        const available = docs.filter(d => d.type !== 'folder').map(d => d.name).join(', ');
+        return { content: [{ type: 'text' as const, text: `No capacity file found for Sprint ${targetSprint}. Available files: ${available}` }], isError: true };
+      }
+
+      // Fetch the document content
+      const content = await getDocumentContent(matchingFile.url, false);
       return {
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify(capacity, null, 2),
+            text: `## Team Capacity - Sprint ${targetSprint}\n\nSource: ${matchingFile.name} (last modified: ${new Date(matchingFile.lastModified).toLocaleDateString()} by ${matchingFile.modifiedBy})\n\n${content}`,
           },
         ],
       };
@@ -1768,6 +1806,185 @@ server.tool(
         content: [{ type: 'text' as const, text: `Error in bulk creation: ${error.message}` }],
         isError: true,
       };
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHAREPOINT TOOLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'sharepoint_login',
+  'Check SharePoint authentication status. If not signed in, triggers device code login and returns instructions.',
+  {},
+  async () => {
+    try {
+      const status = await getAuthStatus();
+      if (status.authenticated) {
+        return { content: [{ type: 'text' as const, text: `✅ Authenticated as **${status.user}**` }] };
+      }
+      const loginResult = await triggerLogin();
+      if (loginResult.authenticated) {
+        return { content: [{ type: 'text' as const, text: `✅ Authenticated as **${loginResult.user}**` }] };
+      }
+      return {
+        content: [{
+          type: 'text' as const,
+          text: loginResult.deviceCodeMessage
+            ? `🔐 **Login Required**\n\n${loginResult.deviceCodeMessage}\n\n**After signing in, try your search again.**`
+            : '❌ Authentication failed. Please try again.',
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_logout',
+  'Sign out of SharePoint and clear cached credentials',
+  {},
+  async () => {
+    try {
+      await logout();
+      return { content: [{ type: 'text' as const, text: '✅ Signed out. Token cache cleared.' }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_status',
+  'Check if currently signed in to SharePoint',
+  {},
+  async () => {
+    try {
+      const status = await getAuthStatus();
+      return {
+        content: [{
+          type: 'text' as const,
+          text: status.authenticated
+            ? `✅ Signed in as **${status.user}**`
+            : '❌ Not signed in. Use sharepoint_login to authenticate.',
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_list_documents',
+  'List documents in a SharePoint document library',
+  {
+    siteUrl: z.string().default(process.env.SHAREPOINT_SITE_URL || '').describe('SharePoint site URL (defaults to SHAREPOINT_SITE_URL env var)'),
+    library: z.string().default(process.env.SHAREPOINT_DEFAULT_LIBRARY || 'Shared Documents').describe('Document library name'),
+    folderPath: z.string().optional().describe('Folder path within the library'),
+    count: z.number().min(1).max(100).default(25).describe('Maximum documents to return'),
+  },
+  async ({ siteUrl, library, folderPath, count }) => {
+    try {
+      if (!siteUrl) return { content: [{ type: 'text' as const, text: 'Error: No siteUrl provided and SHAREPOINT_SITE_URL env var is not set.' }], isError: true };
+      const docs = await listDocuments(siteUrl, library, folderPath, count);
+      return { content: [{ type: 'text' as const, text: formatDocumentList(docs, library) }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_search_documents',
+  'Search for documents across SharePoint sites by keyword',
+  {
+    query: z.string().describe('Search query'),
+    siteUrl: z.string().default(process.env.SHAREPOINT_SITE_URL || '').describe('Limit search to a specific site URL (defaults to SHAREPOINT_SITE_URL env var)'),
+    fileType: z.string().optional().describe("Filter by file type (e.g., 'docx', 'pdf', 'xlsx')"),
+    count: z.number().min(1).max(50).default(20).describe('Maximum results'),
+  },
+  async ({ query, siteUrl, fileType, count }) => {
+    try {
+      const results = await searchDocuments(query, siteUrl || undefined, fileType, count);
+      return { content: [{ type: 'text' as const, text: formatSearchResults(results, query) }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_get_document',
+  'Get content or metadata of a specific document',
+  {
+    documentUrl: z.string().describe('Full URL or path to the document'),
+    metadataOnly: z.boolean().default(false).describe('If true, return only metadata without content'),
+  },
+  async ({ documentUrl, metadataOnly }) => {
+    try {
+      const doc = await getDocumentContent(documentUrl, metadataOnly);
+      return { content: [{ type: 'text' as const, text: doc }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_list_sites',
+  'List accessible SharePoint sites',
+  {
+    query: z.string().optional().describe('Filter sites by name'),
+  },
+  async ({ query }) => {
+    try {
+      const sites = await listSites(query);
+      const rows = sites.map((s: any) => `| ${s.name} | ${s.url} | ${s.description || '-'} |`).join('\n');
+      const text = `## SharePoint Sites\n\n| Name | URL | Description |\n|------|-----|-------------|\n${rows}`;
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_get_list_items',
+  'Get items from a SharePoint list (e.g., Action Items, Tasks, Issues)',
+  {
+    siteUrl: z.string().default(process.env.SHAREPOINT_SITE_URL || '').describe('SharePoint site URL (defaults to SHAREPOINT_SITE_URL env var)'),
+    listName: z.string().describe('Name of the list'),
+    filter: z.string().optional().describe('OData filter expression'),
+    count: z.number().min(1).max(100).default(50).describe('Maximum items'),
+  },
+  async ({ siteUrl, listName, filter, count }) => {
+    try {
+      if (!siteUrl) return { content: [{ type: 'text' as const, text: 'Error: No siteUrl provided and SHAREPOINT_SITE_URL env var is not set.' }], isError: true };
+      const items = await getListItems(siteUrl, listName, filter, count);
+      return { content: [{ type: 'text' as const, text: formatListItems(items, listName) }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'sharepoint_recent_changes',
+  'Get recently modified documents and list items in a site',
+  {
+    siteUrl: z.string().default(process.env.SHAREPOINT_SITE_URL || '').describe('SharePoint site URL (defaults to SHAREPOINT_SITE_URL env var)'),
+    days: z.number().min(1).max(30).default(7).describe('Look back N days'),
+  },
+  async ({ siteUrl, days }) => {
+    try {
+      if (!siteUrl) return { content: [{ type: 'text' as const, text: 'Error: No siteUrl provided and SHAREPOINT_SITE_URL env var is not set.' }], isError: true };
+      const changes = await getRecentChanges(siteUrl, days);
+      return { content: [{ type: 'text' as const, text: changes }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error}` }], isError: true };
     }
   }
 );

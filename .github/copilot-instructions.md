@@ -50,6 +50,61 @@ Maintain consistent structure across all sprint retrospective outputs.
 - Do NOT include links to source data (SharePoint/CSV files) in the email.
 - Always include a Delivery KPIs table and Trend comparison vs. previous sprints.
 
+# Sprint Health Analysis Format
+When asked about sprint health, sprint planning analysis, or sprint status, always produce a structured report with the following 5 sections:
+
+## Section 1: 📊 Team Development Capacity
+- Fetch capacity data from SharePoint (Team Capacity folder) using `get_team_capacity`
+- Present as a table with columns: Member, Developer %, Brutto, Absent, Netto, Dev Capacity, Comments
+- Include a TOTAL row
+- Below the table, summarize: Total Development Capacity, PO/Arch Capacity, Operative Capacity
+
+## Section 2: 📋 Sprint Planning Overview
+- Present as a table with these metrics:
+  - Total Development Capacity (person-days)
+  - Total Remaining Work (User Stories) — sum of estimated effort
+  - Utilization (%) — remaining work / capacity
+  - Buffer (person-days and %)
+  - Number of User Stories
+  - Spillover Stories (count of carryover items)
+- Provide a Verdict: "REALISTICALLY planned", "AT RISK", or "OVERCOMMITTED" based on utilization:
+  - < 85%: Realistically planned
+  - 85-100%: At risk
+  - > 100%: Overcommitted
+
+## Section 3: 🔄 Spillover Stories
+- Use `get_sprint_history` to identify carryovers
+- Split into two sub-sections:
+  - 🚨 Critical Chronic Spillovers (>3 sprints): List with work item ID, title, sprint history, and assigned developer
+  - ⚠️ Recent Spillovers (2 sprints): List with work item ID, title, source sprint, and assigned developer
+- Use bullet points with # prefix for work item IDs
+
+## Section 4: 📈 Sprint Burndown Snapshot
+- Present as a table with these metrics:
+  - Sprint Duration (dates and working days)
+  - Initial Scope (person-days)
+  - Remaining Work (as of current day)
+  - Ideal Remaining (for current day)
+  - Gap vs. Ideal (with ⚠️ if behind)
+  - Working Days Left
+  - Required Daily Burn Rate
+- Calculate based on: stories not Done × average effort, days elapsed vs total days
+
+## Section 5: 🚨 Risks & Observations
+- Split into two sub-sections:
+  - 🔴 Risks: Blocked items, overloaded developers, chronic spillovers, absent team members with assigned work
+  - 🟢 Positive Observations: Good velocity, resolved items, balanced load, delivery alignment
+- Use bullet points with work item IDs where applicable
+- Never blame individuals — focus on systemic patterns
+
+## General Rules for Sprint Health
+- Always include sprint date window in the intro
+- Bold team member names
+- Use person-days as the capacity unit
+- Calculate utilization as (remaining work / development capacity) × 100
+- Flag any developer with >15 person-days assigned as overloaded
+- Flag any story in >3 sprints as needing escalation/splitting
+
 # Data & Response Guidelines
 - Use enterprise data as primary source. Avoid generic responses.
 - When unclear, ask clarifying questions or state assumptions.

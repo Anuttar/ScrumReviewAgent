@@ -8,7 +8,9 @@
         "AZURE_DEVOPS_ORG_URL": "${input:azureDevOpsOrgUrl}",
         "AZURE_DEVOPS_PROJECT": "${input:azureDevOpsProject}",
         "AZURE_DEVOPS_TEAM": "${input:azureDevOpsTeam}",
-        "AZURE_DEVOPS_PAT": "${input:azureDevOpsPat}"
+        "AZURE_DEVOPS_PAT": "${input:azureDevOpsPat}",
+        "SHAREPOINT_SITE_URL": "${input:sharepointSiteUrl}",
+        "GRAPH_TENANT_ID": "${input:graphTenantId}"
       }
     }
   },
@@ -33,6 +35,16 @@
       "type": "promptString",
       "description": "Azure DevOps Personal Access Token (PAT)",
       "password": true
+    },
+    {
+      "id": "sharepointSiteUrl",
+      "type": "promptString",
+      "description": "SharePoint Site URL (e.g., https://company.sharepoint.com/sites/YourTeamSite)"
+    },
+    {
+      "id": "graphTenantId",
+      "type": "promptString",
+      "description": "Azure AD Tenant ID for SharePoint authentication (leave empty for multi-tenant)"
     }
   ]
 }

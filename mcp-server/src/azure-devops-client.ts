@@ -73,6 +73,81 @@ export interface BugTrendData {
   points: BugTrendPoint[];
 }
 
+export interface ChildWorkItem {
+  id: number;
+  title: string;
+  type: string;
+  state: string;
+  stateCategory: 'done' | 'inProgress' | 'notStarted' | 'removed';
+  assignedTo: string;
+  storyPoints: number;
+  completedWork: number;
+  risk: string;
+  iterationPath: string;
+  tags: string;
+  stateChangeDate: string;
+}
+
+export interface BlockerItem {
+  id: number;
+  title: string;
+  reason: string;
+  assignedTo: string;
+}
+
+export interface TeamContribution {
+  name: string;
+  totalItems: number;
+  completed: number;
+  inProgress: number;
+  storyPointsDelivered: number;
+}
+
+export interface DeliveryAnalysisResult {
+  parent: {
+    id: number;
+    title: string;
+    type: string;
+    state: string;
+    assignedTo: string;
+    iterationPath: string;
+    areaPath: string;
+    startDate: string;
+    targetDate: string;
+    activatedDate: string;
+    resolvedDate: string;
+    priority: string | number;
+    risk: string;
+    valueArea: string;
+    tags: string;
+  };
+  generatedAt: string;
+  children: ChildWorkItem[];
+  progress: {
+    total: number;
+    done: number;
+    inProgress: number;
+    notStarted: number;
+    removed: number;
+    percentComplete: number;
+  };
+  storyPoints: {
+    total: number;
+    completed: number;
+    remaining: number;
+    unestimated: number;
+  };
+  timeline: {
+    startDate: string;
+    targetDate: string;
+    daysElapsed: number;
+    daysRemaining: number;
+    status: string;
+  };
+  blockers: BlockerItem[];
+  teamContribution: TeamContribution[];
+}
+
 export interface TeamMemberCapacity {
   teamMember: string;
   activities: { name: string; capacityPerDay: number }[];
@@ -1282,5 +1357,171 @@ export class AzureDevOpsClient {
     }));
 
     return { queryId, queryName, generatedAt: new Date().toISOString(), totalBugs: rawBugs.length, points };
+  }
+
+  // ─── Feature/Epic Delivery Analysis ────────────────────────────────────────
+
+  async getDeliveryAnalysis(workItemId: number): Promise<DeliveryAnalysisResult> {
+    // 1. Fetch the parent work item (cannot combine fields + $expand)
+    const parentUrl = `${this.projectUrl}/_apis/wit/workitems/${workItemId}?$expand=relations&api-version=7.0`;
+    const parent = await this.request<any>(parentUrl);
+
+    const pf = parent.fields;
+    const parentInfo = {
+      id: parent.id,
+      title: pf['System.Title'] || '',
+      type: pf['System.WorkItemType'] || '',
+      state: pf['System.State'] || '',
+      assignedTo: pf['System.AssignedTo']?.displayName || 'Unassigned',
+      iterationPath: pf['System.IterationPath'] || '',
+      areaPath: pf['System.AreaPath'] || '',
+      startDate: pf['Microsoft.VSTS.Scheduling.StartDate'] || pf['System.CreatedDate'] || '',
+      targetDate: pf['Microsoft.VSTS.Scheduling.TargetDate'] || '',
+      activatedDate: pf['Microsoft.VSTS.Common.ActivatedDate'] || '',
+      resolvedDate: pf['Microsoft.VSTS.Common.ResolvedDate'] || pf['Microsoft.VSTS.Common.ClosedDate'] || '',
+      priority: pf['Microsoft.VSTS.Common.Priority'] || '',
+      risk: pf['Microsoft.VSTS.Common.Risk'] || '',
+      valueArea: pf['Microsoft.VSTS.Common.ValueArea'] || '',
+      tags: pf['System.Tags'] || '',
+    };
+
+    // 2. Get child work item IDs from relations
+    const childIds: number[] = [];
+    if (parent.relations) {
+      for (const rel of parent.relations) {
+        if (
+          rel.rel === 'System.LinkTypes.Hierarchy-Forward' &&
+          rel.url
+        ) {
+          const match = rel.url.match(/workItems\/(\d+)/);
+          if (match) childIds.push(parseInt(match[1], 10));
+        }
+      }
+    }
+
+    if (childIds.length === 0) {
+      return {
+        parent: parentInfo,
+        generatedAt: new Date().toISOString(),
+        children: [],
+        progress: { total: 0, done: 0, inProgress: 0, notStarted: 0, removed: 0, percentComplete: 0 },
+        storyPoints: { total: 0, completed: 0, remaining: 0, unestimated: 0 },
+        timeline: { startDate: parentInfo.startDate, targetDate: parentInfo.targetDate, daysElapsed: 0, daysRemaining: 0, status: 'No children' },
+        blockers: [],
+        teamContribution: [],
+      };
+    }
+
+    // 3. Fetch all children details
+    const childFields = 'System.Id,System.Title,System.State,System.WorkItemType,System.AssignedTo,System.IterationPath,Microsoft.VSTS.Scheduling.StoryPoints,Microsoft.VSTS.Scheduling.Effort,Microsoft.VSTS.Scheduling.CompletedWork,Microsoft.VSTS.Common.Risk,System.Tags,Microsoft.VSTS.Common.StateChangeDate';
+    const children: any[] = [];
+    for (let i = 0; i < childIds.length; i += 200) {
+      const batch = childIds.slice(i, i + 200).join(',');
+      const url = `${this.projectUrl}/_apis/wit/workitems?ids=${batch}&fields=${childFields}&api-version=7.0`;
+      const result = await this.request<{ value: any[] }>(url);
+      children.push(...result.value);
+    }
+
+    // 4. Classify states
+    const doneStates = new Set(['Done', 'Closed', 'Completed', 'Resolved', 'Fixed', 'Inactive']);
+    const inProgressStates = new Set(['Active', 'In Progress', 'Committed', 'Open']);
+    const removedStates = new Set(['Removed', 'Cut']);
+
+    const childItems: ChildWorkItem[] = children.map((c) => {
+      const cf = c.fields;
+      const state = cf['System.State'] || '';
+      let stateCategory: 'done' | 'inProgress' | 'notStarted' | 'removed' = 'notStarted';
+      if (doneStates.has(state)) stateCategory = 'done';
+      else if (inProgressStates.has(state)) stateCategory = 'inProgress';
+      else if (removedStates.has(state)) stateCategory = 'removed';
+
+      return {
+        id: c.id,
+        title: cf['System.Title'] || '',
+        type: cf['System.WorkItemType'] || '',
+        state,
+        stateCategory,
+        assignedTo: cf['System.AssignedTo']?.displayName || 'Unassigned',
+        storyPoints: cf['Microsoft.VSTS.Scheduling.StoryPoints'] || cf['Microsoft.VSTS.Scheduling.Effort'] || 0,
+        completedWork: cf['Microsoft.VSTS.Scheduling.CompletedWork'] || 0,
+        risk: cf['Microsoft.VSTS.Common.Risk'] || '',
+        iterationPath: cf['System.IterationPath'] || '',
+        tags: cf['System.Tags'] || '',
+        stateChangeDate: cf['Microsoft.VSTS.Common.StateChangeDate'] || '',
+      };
+    });
+
+    // 5. Progress
+    const active = childItems.filter((c) => c.stateCategory !== 'removed');
+    const done = active.filter((c) => c.stateCategory === 'done').length;
+    const inProgress = active.filter((c) => c.stateCategory === 'inProgress').length;
+    const notStarted = active.filter((c) => c.stateCategory === 'notStarted').length;
+    const removed = childItems.filter((c) => c.stateCategory === 'removed').length;
+    const percentComplete = active.length > 0 ? Math.round((done / active.length) * 100) : 0;
+
+    // 6. Story Points
+    const totalSP = active.reduce((s, c) => s + (c.storyPoints || 0), 0);
+    const completedSP = active.filter((c) => c.stateCategory === 'done').reduce((s, c) => s + (c.storyPoints || 0), 0);
+    const unestimated = active.filter((c) => !c.storyPoints || c.storyPoints === 0).length;
+
+    // 7. Timeline
+    const now = new Date();
+    const start = parentInfo.startDate ? new Date(parentInfo.startDate) : now;
+    const target = parentInfo.targetDate ? new Date(parentInfo.targetDate) : null;
+    const daysElapsed = Math.max(0, Math.floor((now.getTime() - start.getTime()) / 86400000));
+    const daysRemaining = target ? Math.max(0, Math.floor((target.getTime() - now.getTime()) / 86400000)) : -1;
+
+    let timelineStatus = 'On Track';
+    if (target && now > target && percentComplete < 100) timelineStatus = 'Overdue';
+    else if (target && daysRemaining <= 5 && percentComplete < 80) timelineStatus = 'At Risk';
+    else if (percentComplete === 100) timelineStatus = 'Delivered';
+
+    // 8. Blockers / Risks
+    const blockers: BlockerItem[] = [];
+    for (const c of childItems) {
+      if (c.tags?.toLowerCase().includes('blocked')) {
+        blockers.push({ id: c.id, title: c.title, reason: 'Tagged as Blocked', assignedTo: c.assignedTo });
+      }
+      if (c.stateCategory === 'inProgress' && c.stateChangeDate) {
+        const daysSince = Math.floor((now.getTime() - new Date(c.stateChangeDate).getTime()) / 86400000);
+        if (daysSince > 14) {
+          blockers.push({ id: c.id, title: c.title, reason: `In Progress for ${daysSince} days`, assignedTo: c.assignedTo });
+        }
+      }
+      if (c.stateCategory === 'notStarted' && !c.storyPoints) {
+        blockers.push({ id: c.id, title: c.title, reason: 'Unestimated & Not Started', assignedTo: c.assignedTo });
+      }
+    }
+
+    // 9. Team Contribution
+    const devMap = new Map<string, { total: number; done: number; inProgress: number; sp: number }>();
+    for (const c of active) {
+      const dev = c.assignedTo;
+      if (!devMap.has(dev)) devMap.set(dev, { total: 0, done: 0, inProgress: 0, sp: 0 });
+      const entry = devMap.get(dev)!;
+      entry.total++;
+      if (c.stateCategory === 'done') { entry.done++; entry.sp += c.storyPoints || 0; }
+      if (c.stateCategory === 'inProgress') entry.inProgress++;
+    }
+    const teamContribution: TeamContribution[] = [...devMap.entries()]
+      .map(([name, d]) => ({ name, totalItems: d.total, completed: d.done, inProgress: d.inProgress, storyPointsDelivered: d.sp }))
+      .sort((a, b) => b.storyPointsDelivered - a.storyPointsDelivered);
+
+    return {
+      parent: parentInfo,
+      generatedAt: new Date().toISOString(),
+      children: childItems,
+      progress: { total: active.length, done, inProgress, notStarted, removed, percentComplete },
+      storyPoints: { total: totalSP, completed: completedSP, remaining: totalSP - completedSP, unestimated },
+      timeline: {
+        startDate: parentInfo.startDate,
+        targetDate: parentInfo.targetDate,
+        daysElapsed,
+        daysRemaining,
+        status: timelineStatus,
+      },
+      blockers,
+      teamContribution,
+    };
   }
 }

@@ -9,7 +9,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import fetch from 'node-fetch';
 import sharp from 'sharp';
-import { AzureDevOpsClient, AzureDevOpsConfig, BugTrendData } from './azure-devops-client.js';
+import { AzureDevOpsClient, AzureDevOpsConfig, BugTrendData, DeliveryAnalysisResult } from './azure-devops-client.js';
 import { getAuthStatus, logout, triggerLogin } from './sharepoint/auth.js';
 import {
   listDocuments,
@@ -387,6 +387,246 @@ ${statsBox}
     } catch (error: any) {
       return {
         content: [{ type: 'text' as const, text: `Error: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Delivery Analysis for Feature/Epic
+server.tool(
+  'get_delivery_analysis',
+  'Analyze the delivery progress of a Feature or Epic work item. Returns epic overview, delivery health snapshot, feature breakdown with effort, KPIs, observations, and recommendations.',
+  {
+    workItemId: z.number().describe('The work item ID of the Feature or Epic to analyze.'),
+  },
+  async ({ workItemId }) => {
+    try {
+      const result: DeliveryAnalysisResult = await client.getDeliveryAnalysis(workItemId);
+      const p = result.parent;
+      const prog = result.progress;
+      const sp = result.storyPoints;
+      const tl = result.timeline;
+      const orgUrl = process.env.AZURE_DEVOPS_ORG_URL || '';
+      const project = process.env.AZURE_DEVOPS_PROJECT || '';
+      const epicLink = `${orgUrl}/${project}/_workitems/edit/${p.id}`;
+
+      // Helper: format date
+      const fmtDate = (d: string) => d ? new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'Not set';
+
+      // Schedule variance
+      let scheduleVariance = '';
+      let scheduleEmoji = '🟢';
+      if (p.targetDate && p.resolvedDate) {
+        const target = new Date(p.targetDate);
+        const resolved = new Date(p.resolvedDate);
+        const diffDays = Math.round((resolved.getTime() - target.getTime()) / 86400000);
+        if (diffDays > 0) { scheduleVariance = `🔴 **~${diffDays} days late** vs. Target Date (Target ${fmtDate(p.targetDate)} → Resolved ${fmtDate(p.resolvedDate)})`; scheduleEmoji = '🔴'; }
+        else if (diffDays < 0) { scheduleVariance = `🟢 **${Math.abs(diffDays)} days early** (Target ${fmtDate(p.targetDate)} → Resolved ${fmtDate(p.resolvedDate)})`; }
+        else { scheduleVariance = `🟢 **On time** (Resolved on Target Date ${fmtDate(p.targetDate)})`; }
+      } else if (p.targetDate && !p.resolvedDate && tl.status !== 'Delivered') {
+        scheduleVariance = `⏳ In progress — target ${fmtDate(p.targetDate)}, ${tl.daysRemaining >= 0 ? tl.daysRemaining + ' days remaining' : ''}`;
+      } else {
+        scheduleVariance = `ℹ️ No target or resolved date available for variance calculation`;
+      }
+
+      // Scope stability
+      const removedItems = result.children.filter((c) => c.stateCategory === 'removed');
+      const scopeNotes: string[] = [];
+      if (removedItems.length > 0) scopeNotes.push(`${removedItems.length} feature(s) removed`);
+      const scopeEmoji = removedItems.length > 0 ? '🟡' : '🟢';
+
+      // Completed work hours
+      const totalHours = result.children.reduce((s, c) => s + (c.completedWork || 0), 0);
+      const bugFixItems = result.children.filter((c) => c.title.toLowerCase().includes('bug') || c.title.toLowerCase().includes('fix'));
+      const bugFixHours = bugFixItems.reduce((s, c) => s + (c.completedWork || 0), 0);
+      const bugFixShare = totalHours > 0 ? Math.round((bugFixHours / totalHours) * 100) : 0;
+
+      // High risk count
+      const highRiskItems = result.children.filter((c) => c.risk && (c.risk.includes('High') || c.risk.includes('1')));
+
+      // Quality signal
+      let qualitySignal = '🟢 No rework signals detected';
+      if (bugFixItems.length > 0) {
+        qualitySignal = `🟡 Post-release bug-fix feature(s) detected (${bugFixItems.length}) — indicates potential rework`;
+      }
+
+      // Duration
+      let durationText = '';
+      if (p.activatedDate && p.resolvedDate) {
+        const activated = new Date(p.activatedDate);
+        const resolved = new Date(p.resolvedDate);
+        const months = Math.round((resolved.getTime() - activated.getTime()) / (30 * 86400000));
+        durationText = `~${months} month(s) (${fmtDate(p.activatedDate)} → ${fmtDate(p.resolvedDate)})`;
+      }
+
+      // Estimate vs Actuals
+      let estimateVsActual = '';
+      if (sp.total > 0 && totalHours > 0) {
+        const ratio = (totalHours / sp.total).toFixed(1);
+        estimateVsActual = `${sp.total} SP estimated vs. ${totalHours.toFixed(1)} h logged — **~${ratio}× variance**`;
+      }
+
+      // === BUILD OUTPUT ===
+
+      // Section 1: Epic Overview
+      const stateEmoji = tl.status === 'Delivered' || p.state === 'Resolved' || p.state === 'Closed' ? '✅' : p.state === 'Active' ? '🔄' : '⬜';
+      const iterShort = p.iterationPath.split('\\').slice(-1)[0] || p.iterationPath;
+
+      const overviewSection = [
+        `## 📊 Delivery Analysis — ${p.type} #${p.id}`,
+        `**${p.title}**`,
+        '',
+        '---',
+        '',
+        '### 🎯 Epic Overview',
+        '',
+        '| Attribute | Value |',
+        '|-----------|-------|',
+        `| **${p.type} ID** | [#${p.id}](${epicLink}) |`,
+        `| **Title** | ${p.title} |`,
+        `| **Product Owner** | ${p.assignedTo} |`,
+        `| **Team / Area Path** | ${p.areaPath || p.iterationPath} |`,
+        `| **State** | ${stateEmoji} **${p.state}** |`,
+        `| **Priority / Risk** | ${p.priority || '-'} / ${p.risk || '-'} |`,
+        `| **Value Area** | ${p.valueArea || '-'} |`,
+        `| **Planned Start** | ${fmtDate(p.startDate)} |`,
+        `| **Planned Target** | ${fmtDate(p.targetDate)} |`,
+        `| **Activated Date** | ${fmtDate(p.activatedDate)} |`,
+        `| **Resolved Date** | ${fmtDate(p.resolvedDate)} |`,
+        `| **Tags** | ${p.tags || '-'} |`,
+      ].join('\n');
+
+      // Section 2: Delivery Health Snapshot
+      const healthSection = [
+        '',
+        '---',
+        '',
+        '### 🚦 Delivery Health Snapshot',
+        '',
+        `- **Overall Status:** ${stateEmoji} **${tl.status}** — ${prog.done}/${prog.total} features completed (${prog.percentComplete}%)`,
+        `- **Schedule Variance:** ${scheduleVariance}`,
+        `- **Scope Stability:** ${scopeEmoji} ${scopeNotes.length > 0 ? scopeNotes.join('; ') : 'No scope changes detected'}`,
+        `- **Quality Signal:** ${qualitySignal}`,
+      ].join('\n');
+
+      // Section 3: Feature Breakdown
+      const featureRows = result.children.map((c, i) => {
+        const stEmoji = c.stateCategory === 'done' ? '✅ Closed' : c.stateCategory === 'inProgress' ? '🔄 In Progress' : c.stateCategory === 'removed' ? '❌ **Removed**' : '⬜ Not Started';
+        const iterShort2 = c.iterationPath.split('\\').slice(-1)[0] || '-';
+        const workHrs = c.completedWork ? c.completedWork.toFixed(1) : '—';
+        const riskVal = c.risk || '—';
+        return `| ${i + 1} | ${c.id} | ${c.title} | ${stEmoji} | ${iterShort2} | ${workHrs} | ${riskVal} |`;
+      }).join('\n');
+
+      const featureSection = [
+        '',
+        '---',
+        '',
+        `### 📦 Feature Breakdown (${result.children.length} Features)`,
+        '',
+        '| # | Feature ID | Title | State | Iteration | Completed Work (h) | Risk |',
+        '|---|-----------|-------|-------|-----------|-------------------:|------|',
+        featureRows,
+      ].join('\n');
+
+      // Section 4: Delivery KPIs
+      const kpiSection = [
+        '',
+        '---',
+        '',
+        '### 📈 Delivery KPIs',
+        '',
+        '| KPI | Value |',
+        '|-----|-------|',
+        `| **Total Features Planned** | ${result.children.length} |`,
+        `| **Features Delivered (Closed)** | ${prog.done} (${prog.percentComplete}%) |`,
+        `| **Features Removed** | ${prog.removed} (${result.children.length > 0 ? Math.round((prog.removed / result.children.length) * 100) : 0}%)${removedItems.length > 0 ? ' — ' + removedItems.map((r) => `#${r.id}`).join(', ') : ''} |`,
+        `| **Total Completed Work Logged** | **~${totalHours.toFixed(1)} hours** |`,
+        `| **Bug Fix Effort Share** | ~${bugFixShare}% (${bugFixHours.toFixed(1)} h of ${totalHours.toFixed(1)} h) |`,
+        `| **High-Risk Features** | ${highRiskItems.length} out of ${result.children.length} (${result.children.length > 0 ? Math.round((highRiskItems.length / result.children.length) * 100) : 0}%) |`,
+        durationText ? `| **Duration (Activated → Resolved)** | ${durationText} |` : '',
+        estimateVsActual ? `| **Original Estimate vs. Actuals** | ${estimateVsActual} |` : '',
+      ].filter(Boolean).join('\n');
+
+      // Section 5: Key Delivery Observations
+      const wentWell: string[] = [];
+      if (prog.percentComplete === 100) wentWell.push(`- **${p.type} delivered end-to-end** — all planned features completed.`);
+      if (prog.done >= 5) wentWell.push(`- Strong iterative delivery: ${prog.done} features closed successfully.`);
+      if (result.teamContribution.length === 1) wentWell.push(`- Sole contributor (**${result.teamContribution[0].name}**) delivered all ${prog.done} features.`);
+      else if (result.teamContribution.length > 1) wentWell.push(`- Collaborative delivery across ${result.teamContribution.length} team members.`);
+
+      const watchAreas: string[] = [];
+      if (bugFixShare > 30) watchAreas.push(`- **High rework** — bug-fix effort consumed ~${bugFixShare}% of total logged hours, suggesting insufficient upstream test coverage.`);
+      if (removedItems.length > 0) watchAreas.push(`- **Scope churn** — ${removedItems.length} feature(s) removed after planning (${removedItems.map((r) => `#${r.id} ${r.title}`).join(', ')}).`);
+      if (estimateVsActual && totalHours / sp.total > 2) watchAreas.push(`- **Estimation accuracy** — actuals exceeded estimates significantly, signaling under-sizing during grooming.`);
+
+      const risks: string[] = [];
+      if (highRiskItems.length > result.children.length * 0.5) risks.push(`- ${Math.round((highRiskItems.length / result.children.length) * 100)}% of features tagged as **High Risk** — risk mitigation strategy should be reviewed.`);
+      if (scheduleEmoji === '🔴') risks.push(`- Target date slipped — review scheduling assumptions.`);
+      if (result.blockers.length > 0) {
+        for (const b of result.blockers) {
+          risks.push(`- 🚨 **#${b.id}** — ${b.reason} (${b.assignedTo})`);
+        }
+      }
+
+      const obsSection = [
+        '',
+        '---',
+        '',
+        '### 🔎 Key Delivery Observations',
+        '',
+        '**🟢 Went Well**',
+        '',
+        wentWell.length > 0 ? wentWell.join('\n') : '- No specific highlights.',
+        '',
+        '**🟡 Watch Areas**',
+        '',
+        watchAreas.length > 0 ? watchAreas.join('\n') : '- No concerns detected.',
+        '',
+        '**🔴 Risks / Concerns**',
+        '',
+        risks.length > 0 ? risks.join('\n') : '- No active risks.',
+      ].join('\n');
+
+      // Section 6: Recommendations
+      const recs: string[] = [];
+      if (bugFixShare > 30) recs.push(`1. **Retrospective Deep-Dive** on bug-fix features — was the release under-tested? Strengthen Definition of Done with mandatory test coverage before release.`);
+      if (removedItems.length > 0) recs.push(`${recs.length + 1}. **Refinement Discipline** — introduce a "Ready for Sprint" gate to reduce features being removed after activation.`);
+      if (estimateVsActual && totalHours / sp.total > 2) recs.push(`${recs.length + 1}. **Estimation Calibration** — re-baseline story-point calibration to reduce effort variance.`);
+      if (highRiskItems.length > result.children.length * 0.5) recs.push(`${recs.length + 1}. **Risk Register** — high ratio of high-risk features warrants explicit risk-burndown tracking.`);
+      if (sp.unestimated > 0) recs.push(`${recs.length + 1}. **Backlog Hygiene** — estimate the ${sp.unestimated} unestimated item(s) for velocity accuracy.`);
+      if (tl.status === 'At Risk' || tl.status === 'Overdue') recs.push(`${recs.length + 1}. **Escalate & Re-plan** — timeline has slipped; align with stakeholders on revised date.`);
+      if (recs.length === 0) recs.push('1. ✅ Delivery is healthy. Continue current practices and monitor upcoming releases.');
+
+      const recsSection = [
+        '',
+        '---',
+        '',
+        '### 💡 Recommendations (Agile Coach Mode)',
+        '',
+        ...recs,
+      ].join('\n');
+
+      // Section 7: Footer
+      const footerSection = [
+        '',
+        '---',
+        '',
+        `📎 **${p.type} Link:** [${p.type} #${p.id} in Azure DevOps](${epicLink})`,
+        '',
+        'Would you like me to:',
+        `- 🔍 Drill into a specific feature (e.g., bug-fix analysis)?`,
+        `- 📧 Draft a **leadership summary email**?`,
+        `- 📊 Generate a **sprint-over-sprint delivery trend** for this ${p.type.toLowerCase()}?`,
+      ].join('\n');
+
+      const fullText = [overviewSection, healthSection, featureSection, kpiSection, obsSection, recsSection, footerSection].join('\n');
+
+      return { content: [{ type: 'text' as const, text: fullText }] };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error analyzing delivery for work item: ${error.message}` }],
         isError: true,
       };
     }

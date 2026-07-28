@@ -116,13 +116,14 @@ server.tool(
 // Tool: Get Sprint Burndown
 server.tool(
   'get_sprint_burndown',
-  'Create sprint burndown chart with Monday-Friday working-day ideal burn and development burn trajectories. Returns an annotated SVG line chart, day-by-day data grid, and statistics.',
+  'Create sprint burndown chart with Monday-Friday working-day ideal burn and development burn trajectories. Returns an annotated PNG line chart, day-by-day data grid, statistics, and optional CSV export.',
   {
     iterationId: z.string().optional().describe('Sprint iteration ID. If not provided, uses current sprint.'),
     queryDate: z.string().optional().describe('Date to highlight in YYYY-MM-DD format. If not provided, uses today.'),
-    includeChart: z.boolean().default(true).describe('If true, includes an SVG burndown chart in the output.'),
+    includeChart: z.boolean().default(true).describe('If true, includes a PNG burndown chart in the output.'),
+    includeCsv: z.boolean().default(true).describe('If true, exports the burndown source data to a CSV file and returns the file path.'),
   },
-  async ({ iterationId, queryDate, includeChart }) => {
+  async ({ iterationId, queryDate, includeChart, includeCsv }) => {
     try {
       const burndown = await client.getSprintBurndown(iterationId, queryDate);
 
@@ -146,6 +147,35 @@ server.tool(
           return `| D${p.dayIndex} | ${p.dayLabel.replace(`Day ${p.dayIndex} `, '')} | ${p.idealRemaining} | ${p.developmentRemaining} | ${p.teamTargetRemaining}${marker} |`;
         })
         .join('\n');
+
+      // CSV export from the same points used to render the chart
+      const csvHeader = [
+        'dayIndex',
+        'dayLabel',
+        'date',
+        'scope',
+        'completed',
+        'remaining',
+        'developmentRemaining',
+        'teamTargetRemaining',
+        'idealRemaining',
+        'isQueryDate',
+      ].join(',');
+      const csvRows = burndown.points
+        .map((p) => [
+          p.dayIndex,
+          `"${String(p.dayLabel).replace(/"/g, '""')}"`,
+          p.date,
+          p.scope,
+          p.completed,
+          p.remaining,
+          p.developmentRemaining,
+          p.teamTargetRemaining,
+          p.idealRemaining,
+          p.isQueryDate,
+        ].join(','))
+        .join('\n');
+      const csvContent = `${csvHeader}\n${csvRows}`;
 
       // ─── SVG Annotated Burndown Chart ──────────────────────────────────────
       let svgChart: string | undefined;
@@ -309,6 +339,7 @@ ${statsBox}
       const contentBlocks: { type: string; text?: string; data?: string; mimeType?: string }[] = [];
 
       let chartTempPath: string | undefined;
+      let csvTempPath: string | undefined;
 
       if (svgChart) {
         // Convert SVG → PNG (Outlook supports PNG; not SVG)
@@ -328,13 +359,26 @@ ${statsBox}
         });
       }
 
-      const summaryWithChartPath = chartTempPath
-        ? summaryText + `\n\n> **Chart saved to:** \`${chartTempPath}\` — pass this path as \`chartImagePath\` to \`draft_sprint_email\` to embed the chart visually in Outlook.`
+      if (includeCsv) {
+        csvTempPath = path.join(os.tmpdir(), 'sprint_burndown_data.csv');
+        fs.writeFileSync(csvTempPath, csvContent, 'utf-8');
+      }
+
+      const pathNotes: string[] = [];
+      if (chartTempPath) {
+        pathNotes.push(`> **Chart saved to:** \`${chartTempPath}\` — pass this path as \`chartImagePath\` to \`draft_sprint_email\` to embed the chart visually in Outlook.`);
+      }
+      if (csvTempPath) {
+        pathNotes.push(`> **CSV saved to:** \`${csvTempPath}\` — exported from the same data points used to render the chart.`);
+      }
+
+      const summaryWithExports = pathNotes.length > 0
+        ? `${summaryText}\n\n${pathNotes.join('\n')}`
         : summaryText;
 
       contentBlocks.push({
         type: 'text' as const,
-        text: summaryWithChartPath,
+        text: summaryWithExports,
       });
 
       return {

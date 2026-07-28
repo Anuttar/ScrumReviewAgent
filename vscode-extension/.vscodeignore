@@ -1,0 +1,13 @@
+.vscode/**
+.vscode-test/**
+src/**
+scripts/**
+tsconfig.json
+**/*.map
+**/*.ts
+.gitignore
+node_modules/**
+!server/mcp-server/dist/**
+!server/mcp-server/node_modules/**
+!server/mcp-server/scripts/**
+!server/mcp-server/package.json

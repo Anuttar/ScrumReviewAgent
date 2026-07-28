@@ -4,8 +4,11 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Subject,
 
-    [Parameter(Mandatory=$true)]
-    [string]$Body,
+    [Parameter(Mandatory=$false)]
+    [string]$Body = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$BodyFilePath = "",
 
     [Parameter(Mandatory=$false)]
     [string]$To = "",
@@ -14,6 +17,16 @@ param(
     [ValidateSet("HTML", "Plain")]
     [string]$BodyFormat = "HTML"
 )
+
+# If BodyFilePath is provided, read body from file
+if ($BodyFilePath -ne "" -and (Test-Path $BodyFilePath)) {
+    $Body = Get-Content -Path $BodyFilePath -Raw -Encoding UTF8
+}
+
+if ($Body -eq "") {
+    Write-Output (@{ success = $false; message = "No body content provided. Use -Body or -BodyFilePath." } | ConvertTo-Json)
+    exit 1
+}
 
 try {
     # Connect to running Outlook instance or start one

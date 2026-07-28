@@ -1313,53 +1313,222 @@ server.tool(
       if (chartImagePath && fs.existsSync(chartImagePath)) {
         const pngData = fs.readFileSync(chartImagePath);
         const pngBase64 = pngData.toString('base64');
-        chartImgTag = `<div style="margin:16px 0;"><img src="data:image/png;base64,${pngBase64}" width="860" style="max-width:100%;border:1px solid #dce3ef;border-radius:4px;display:block;"/></div>`;
+        chartImgTag = `<hr/><h2>📈 Sprint Burndown</h2><div style="margin:16px 0;"><img src="data:image/png;base64,${pngBase64}" width="860" style="max-width:100%;border:1px solid #dce3ef;border-radius:4px;display:block;"/></div>`;
       }
 
-      // Inject chart after first <h3> or at the start of body if no heading found
+      // Append chart at the end of the body (after all content sections)
       let bodyWithChart = body;
       if (chartImgTag) {
-        // Insert chart right after the first </h2> or </h3>, or prepend
-        const insertAfter = body.match(/<\/h[23]>/i);
-        if (insertAfter && insertAfter.index !== undefined) {
-          const insertIdx = insertAfter.index + insertAfter[0].length;
-          bodyWithChart = body.slice(0, insertIdx) + chartImgTag + body.slice(insertIdx);
-        } else {
-          bodyWithChart = chartImgTag + body;
-        }
+        bodyWithChart = body + chartImgTag;
       }
 
-      // Wrap the body in a styled HTML template
+      // Wrap the body in a professional Outlook-compatible HTML email template
       const htmlBody = `
 <!DOCTYPE html>
-<html>
+<html xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
 <head>
-<style>
-  body { font-family: Calibri, Segoe UI, sans-serif; font-size: 11pt; color: #333; }
-  table { border-collapse: collapse; width: 100%; margin: 10px 0; }
-  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 10pt; }
-  th { background-color: #0078d4; color: white; }
-  tr:nth-child(even) { background-color: #f9f9f9; }
-  h2 { color: #0078d4; border-bottom: 2px solid #0078d4; padding-bottom: 5px; }
-  h3 { color: #333; }
-  .critical { color: #d13438; font-weight: bold; }
-  .warning { color: #f7630c; font-weight: bold; }
-  .good { color: #107c10; font-weight: bold; }
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<!--[if mso]>
+<style type="text/css">
+  table {border-collapse:collapse;}
+  td, th {font-family:Calibri,Segoe UI,sans-serif;}
+</style>
+<![endif]-->
+<style type="text/css">
+  /* Reset */
+  body, table, td, th, p, div, span, a, li, ul, ol, h1, h2, h3, h4 {
+    margin: 0; padding: 0;
+  }
+  body {
+    font-family: 'Segoe UI', Calibri, Arial, Helvetica, sans-serif;
+    font-size: 10.5pt;
+    color: #1a1a1a;
+    line-height: 1.5;
+    background-color: #f4f4f4;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* Outer wrapper */
+  .email-wrapper {
+    max-width: 780px;
+    margin: 0 auto;
+    background-color: #ffffff;
+    border: 1px solid #e0e0e0;
+  }
+
+  /* Header banner */
+  .email-header {
+    background: linear-gradient(135deg, #0078d4, #005a9e);
+    padding: 18px 28px;
+    color: #ffffff;
+  }
+  .email-header h1 {
+    font-size: 16pt;
+    font-weight: 600;
+    color: #ffffff;
+    margin: 0;
+    letter-spacing: 0.3px;
+  }
+  .email-header p {
+    font-size: 9.5pt;
+    color: #cce4f7;
+    margin-top: 4px;
+  }
+
+  /* Body content */
+  .email-body {
+    padding: 24px 28px;
+  }
+
+  /* Section headings */
+  h2 {
+    font-size: 12.5pt;
+    font-weight: 600;
+    color: #0078d4;
+    border-bottom: 2px solid #0078d4;
+    padding-bottom: 5px;
+    margin: 20px 0 10px 0;
+  }
+  h3 {
+    font-size: 11pt;
+    font-weight: 600;
+    color: #333333;
+    margin: 16px 0 8px 0;
+  }
+  h4 {
+    font-size: 10.5pt;
+    font-weight: 600;
+    color: #444444;
+    margin: 12px 0 6px 0;
+  }
+
+  /* Paragraphs & lists */
+  p {
+    font-size: 10.5pt;
+    color: #1a1a1a;
+    margin: 6px 0;
+    line-height: 1.55;
+  }
+  ul, ol {
+    margin: 6px 0 6px 20px;
+    padding: 0;
+  }
+  li {
+    font-size: 10.5pt;
+    color: #1a1a1a;
+    margin-bottom: 4px;
+    line-height: 1.5;
+  }
+
+  /* Tables */
+  table {
+    border-collapse: collapse;
+    width: auto;
+    margin: 10px 0 16px 0;
+    font-size: 10pt;
+  }
+  th {
+    background-color: #0078d4;
+    color: #ffffff;
+    font-weight: 600;
+    padding: 8px 10px;
+    text-align: left;
+    border: 1px solid #005a9e;
+    font-size: 10pt;
+  }
+  td {
+    padding: 7px 10px;
+    border: 1px solid #dce3ef;
+    color: #1a1a1a;
+    font-size: 10pt;
+    vertical-align: top;
+  }
+  tr:nth-child(even) td {
+    background-color: #f5f8fc;
+  }
+  tr:hover td {
+    background-color: #e8f0fe;
+  }
+
+  /* Status classes */
+  .critical, .risk-high { color: #d13438; font-weight: 600; }
+  .warning, .risk-medium { color: #f7630c; font-weight: 600; }
+  .good, .risk-low { color: #107c10; font-weight: 600; }
+
+  /* KPI highlight */
+  strong {
+    font-weight: 600;
+  }
+
+  /* Horizontal rule */
+  hr {
+    border: none;
+    border-top: 1px solid #e0e0e0;
+    margin: 18px 0;
+  }
+
+  /* Links */
+  a {
+    color: #0078d4;
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+
+  /* Footer */
+  .email-footer {
+    background-color: #f8f8f8;
+    border-top: 1px solid #e0e0e0;
+    padding: 12px 28px;
+    font-size: 8.5pt;
+    color: #888888;
+  }
+  .email-footer p {
+    font-size: 8.5pt;
+    color: #888888;
+    margin: 2px 0;
+  }
+
+  /* Blockquote for callouts */
+  blockquote {
+    border-left: 3px solid #0078d4;
+    padding: 8px 12px;
+    margin: 10px 0;
+    background-color: #f0f6ff;
+    font-size: 10pt;
+    color: #333;
+  }
 </style>
 </head>
 <body>
-${bodyWithChart}
-<br/><hr/>
-<p style="font-size:9pt;color:#888;">Generated by Sprint Review Analyst Agent on ${new Date().toLocaleDateString()}</p>
+<div class="email-wrapper">
+  <div class="email-header">
+    <h1>${subject}</h1>
+    <p>Generated on ${new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} by SARA (Scrum Assistant in Reporting and Automation)</p>
+  </div>
+  <div class="email-body">
+    ${bodyWithChart}
+  </div>
+  <div class="email-footer">
+    <p>This report was generated by SARA &mdash; Scrum Assistant in Reporting and Automation</p>
+    <p>Please do not reply to this email directly. For questions, contact the Scrum Master.</p>
+  </div>
+</div>
 </body>
 </html>`;
+
+      // Write HTML body to a temp file to avoid command-line length limits
+      const bodyTempPath = path.join(os.tmpdir(), 'sara_email_body.html');
+      fs.writeFileSync(bodyTempPath, htmlBody, 'utf-8');
 
       const args = [
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
         '-File', scriptPath,
         '-Subject', subject,
-        '-Body', htmlBody,
+        '-BodyFilePath', bodyTempPath,
         '-BodyFormat', 'HTML',
       ];
 

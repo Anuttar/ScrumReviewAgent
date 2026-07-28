@@ -57,6 +57,22 @@ export interface SprintBurndown {
   points: SprintBurndownPoint[];
 }
 
+export interface BugTrendPoint {
+  release: string;         // Iteration short name (e.g. "Sprint 15")
+  iterationPath: string;   // Full iteration path
+  total: number;           // Total bugs in this release
+  active: number;          // Bugs in Active / New / In-Progress states
+  resolved: number;        // Bugs in Resolved / Closed / Done states
+}
+
+export interface BugTrendData {
+  queryId: string;
+  queryName?: string;
+  generatedAt: string;
+  totalBugs: number;
+  points: BugTrendPoint[];
+}
+
 export interface TeamMemberCapacity {
   teamMember: string;
   activities: { name: string; capacityPerDay: number }[];
@@ -1178,5 +1194,93 @@ export class AzureDevOpsClient {
       previousFields,
       actualFields,
     };
+  }
+
+  // ─── Bug Trend ──────────────────────────────────────────────────────────────
+
+  async runQueryById(queryId: string): Promise<{ ids: number[]; queryName?: string }> {
+    // Accept either a UUID or a full query URL — extract the UUID
+    const uuidMatch = queryId.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    const id = uuidMatch ? uuidMatch[0] : queryId.trim();
+
+    // Try to fetch query metadata (name) — non-fatal if it fails
+    let queryName: string | undefined;
+    try {
+      const meta = await this.request<{ name: string }>(
+        `${this.projectUrl}/_apis/wit/queries/${id}?api-version=7.0`
+      );
+      queryName = meta.name;
+    } catch { /* ignore */ }
+
+    // Execute the stored WIQL query
+    const result = await this.request<{
+      workItems?: { id: number }[];
+      workItemRelations?: { target?: { id: number } }[];
+    }>(`${this.projectUrl}/_apis/wit/wiql/${id}?api-version=7.0`);
+
+    let ids: number[] = [];
+    if (result.workItems) {
+      ids = result.workItems.map((w) => w.id);
+    } else if (result.workItemRelations) {
+      ids = result.workItemRelations
+        .filter((r) => r.target)
+        .map((r) => r.target!.id);
+    }
+
+    return { ids, queryName };
+  }
+
+  async getBugTrendData(queryId: string): Promise<BugTrendData> {
+    const { ids, queryName } = await this.runQueryById(queryId);
+
+    if (ids.length === 0) {
+      return { queryId, queryName, generatedAt: new Date().toISOString(), totalBugs: 0, points: [] };
+    }
+
+    // Fetch work items in batches of 200
+    const rawBugs: { id: number; state: string; iterationPath: string }[] = [];
+    const fields = 'System.Id,System.State,System.IterationPath';
+
+    for (let i = 0; i < ids.length; i += 200) {
+      const batch = ids.slice(i, i + 200).join(',');
+      const url = `${this.projectUrl}/_apis/wit/workitems?ids=${batch}&fields=${fields}&api-version=7.0`;
+      const result = await this.request<{ value: any[] }>(url);
+      for (const item of result.value) {
+        rawBugs.push({
+          id: item.id,
+          state: item.fields['System.State'] || '',
+          iterationPath: item.fields['System.IterationPath'] || 'Unassigned',
+        });
+      }
+    }
+
+    // Group by last segment of iteration path (the sprint/release label)
+    const releaseMap = new Map<string, { path: string; bugs: typeof rawBugs }>();
+    for (const bug of rawBugs) {
+      const parts = bug.iterationPath.split('\\');
+      const label = parts[parts.length - 1] || bug.iterationPath;
+      if (!releaseMap.has(label)) {
+        releaseMap.set(label, { path: bug.iterationPath, bugs: [] });
+      }
+      releaseMap.get(label)!.bugs.push(bug);
+    }
+
+    // Sort releases by full path (preserves sprint ordering)
+    const sorted = [...releaseMap.entries()].sort((a, b) =>
+      a[1].path.localeCompare(b[1].path)
+    );
+
+    const activeStates = new Set(['Active', 'New', 'Committed', 'In Progress', 'Open', 'Approved']);
+    const resolvedStates = new Set(['Resolved', 'Closed', 'Done', 'Completed', 'Fixed', 'Inactive']);
+
+    const points: BugTrendPoint[] = sorted.map(([release, { path, bugs }]) => ({
+      release,
+      iterationPath: path,
+      total: bugs.length,
+      active: bugs.filter((b) => activeStates.has(b.state)).length,
+      resolved: bugs.filter((b) => resolvedStates.has(b.state)).length,
+    }));
+
+    return { queryId, queryName, generatedAt: new Date().toISOString(), totalBugs: rawBugs.length, points };
   }
 }

@@ -9,7 +9,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import fetch from 'node-fetch';
 import sharp from 'sharp';
-import { AzureDevOpsClient, AzureDevOpsConfig } from './azure-devops-client.js';
+import { AzureDevOpsClient, AzureDevOpsConfig, BugTrendData } from './azure-devops-client.js';
 import { getAuthStatus, logout, triggerLogin } from './sharepoint/auth.js';
 import {
   listDocuments,
@@ -387,6 +387,475 @@ ${statsBox}
     } catch (error: any) {
       return {
         content: [{ type: 'text' as const, text: `Error: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: Get Bug Trend Chart per Release
+server.tool(
+  'get_bug_trend_chart',
+  'Generate a bug trend chart per release/sprint from an Azure DevOps saved query. Shows total, active, and resolved bug counts per iteration. If no queryId is provided, asks the user for it.',
+  {
+    queryId: z.string().optional().describe(
+      'Azure DevOps saved query ID (UUID) or full query URL. ' +
+      'Example: "a1b2c3d4-..." or "https://dev.azure.com/org/project/_queries/query/a1b2c3d4-...". ' +
+      'Leave empty to get instructions on how to find the query ID.'
+    ),
+    includeChart: z.boolean().default(false).describe('If true, generates a PNG bug trend chart.'),
+    includeCsv: z.boolean().default(true).describe('If true, exports the trend data to a CSV file.'),
+    chartType: z.string().optional().describe(
+      'Trend chart type. Supported values: 1|line-only, 2|stacked-bar, 3|comparison, 4|cumulative, 5|release-family, 6|regenerate.'
+    ),
+  },
+  async ({ queryId, includeChart, includeCsv, chartType }) => {
+    // ── Guard: prompt if no query ID supplied ───────────────────────────────
+    if (!queryId || queryId.trim() === '') {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: [
+            '## 🐞 Bug Trend Chart — Query ID Required',
+            '',
+            'To generate the bug trend chart, please provide an **Azure DevOps saved query ID** or the **query URL**.',
+            '',
+            '**How to get your Query ID:**',
+            '1. Go to **Azure DevOps → Boards → Queries**',
+            '2. Open the saved query that returns bugs',
+            '3. Copy the browser URL — it contains the query ID, for example:',
+            '   ```',
+            '   https://dev.azure.com/{org}/{project}/_queries/query/a1b2c3d4-5678-90ab-cdef-012345678901',
+            '   ```',
+            '',
+            '**You can provide either:**',
+            '- Full URL: `https://dev.azure.com/org/project/_queries/query/a1b2c3d4-...`',
+            '- Just the UUID: `a1b2c3d4-5678-90ab-cdef-012345678901`',
+            '',
+            '*Example prompt: "Show bug trend chart for query a1b2c3d4-5678-90ab-cdef-012345678901"*',
+          ].join('\n'),
+        }],
+      };
+    }
+
+    try {
+      const trend: BugTrendData = await client.getBugTrendData(queryId);
+
+      const rawChartType = (chartType || '').trim().toLowerCase();
+      const chartTypeAliases: Record<string, string> = {
+        '1': 'line-only',
+        'line-only': 'line-only',
+        'line only': 'line-only',
+        '2': 'stacked-bar',
+        'stacked-bar': 'stacked-bar',
+        'stacked bar': 'stacked-bar',
+        '3': 'comparison',
+        'comparison': 'comparison',
+        '4': 'cumulative',
+        'cumulative': 'cumulative',
+        '5': 'release-family',
+        'release-family': 'release-family',
+        'release family': 'release-family',
+        '6': 'regenerate',
+        'regenerate': 'regenerate',
+      };
+      const selectedChartType = chartTypeAliases[rawChartType];
+      const shouldRenderChart = includeChart || !!selectedChartType;
+      const chartTypeLabelMap: Record<string, string> = {
+        'line-only': '📉 Line-only trend chart',
+        'stacked-bar': '📊 Stacked bar chart',
+        comparison: '🔀 Comparison chart',
+        cumulative: '📈 Cumulative trend',
+        'release-family': '🎨 Grouped by release family',
+        regenerate: '🔄 Regenerated style chart',
+      };
+
+      if (chartType && !selectedChartType) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [
+              `Chart type \`${chartType}\` is not recognized.`,
+              '',
+              'Please choose one of the supported options:',
+              '1. 📉 Line-only trend chart',
+              '2. 📊 Stacked bar chart',
+              '3. 🔀 Comparison chart',
+              '4. 📈 Cumulative trend',
+              '5. 🎨 Grouped by release family',
+              '6. 🔄 Regenerate the same chart',
+            ].join('\n'),
+          }],
+          isError: true,
+        };
+      }
+
+      if (trend.points.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No bugs found for query \`${queryId}\`. The query returned 0 work items.` }],
+        };
+      }
+
+      // ── SVG Bug Trend Chart (selectable visualization) ──────────────────
+      let svgChart: string | undefined;
+      if (shouldRenderChart) {
+        const points = trend.points;
+        const n = points.length;
+        const margin = { top: 60, right: 40, bottom: 120, left: 60 };
+        const width = 900;
+        const height = 500;
+        const plotW = width - margin.left - margin.right;
+        const plotH = height - margin.top - margin.bottom;
+
+        const xmlEscape = (value: string): string =>
+          value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+        const buildGridAndAxis = (
+          yAxisMax: number,
+          xLabels: string,
+          title: string,
+          seriesSvg: string,
+          legendSvg: string,
+          yLabel = 'Bug Count'
+        ): string => {
+          const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+          const yTicks = 5;
+          let gridLines = '';
+          for (let t = 0; t <= yTicks; t++) {
+            const val = Math.round((yAxisMax / yTicks) * t);
+            const y = yScale(val);
+            gridLines += `<line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" stroke="#e0e0e0" stroke-width="0.6"/>`;
+            gridLines += `<text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" font-size="10" fill="#333">${val}</text>`;
+          }
+
+          return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="font-family:Arial,sans-serif;">
+<rect x="0" y="0" width="${width}" height="${height}" fill="white"/>
+<text x="${width / 2}" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">${xmlEscape(title)}</text>
+<text x="14" y="${margin.top + plotH / 2}" text-anchor="middle" font-size="11" fill="#333" transform="rotate(-90 14 ${margin.top + plotH / 2})">${xmlEscape(yLabel)}</text>
+<text x="${margin.left + plotW / 2}" y="${height - 5}" text-anchor="middle" font-size="11" fill="#333">Release / Sprint</text>
+${gridLines}
+<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + plotH}" stroke="#333" stroke-width="1"/>
+<line x1="${margin.left}" y1="${margin.top + plotH}" x2="${width - margin.right}" y2="${margin.top + plotH}" stroke="#333" stroke-width="1"/>
+${seriesSvg}
+${xLabels}
+${legendSvg}
+</svg>`;
+        };
+
+        const xScale = (i: number) => margin.left + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+        const xLabelSvg = points
+          .map((p, i) => {
+            const x = xScale(i);
+            return `<text x="${x}" y="${margin.top + plotH + 14}" text-anchor="end" font-size="9" fill="#333" transform="rotate(-45 ${x} ${margin.top + plotH + 14})">${xmlEscape(p.release)}</text>`;
+          })
+          .join('');
+
+        const effectiveChartType = selectedChartType || 'line-only';
+
+        if (effectiveChartType === 'line-only') {
+          const yAxisMax = Math.ceil(Math.max(1, ...points.map((p) => p.total)) * 1.15);
+          const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+          const line = points.map((p, i) => `${xScale(i)},${yScale(p.total)}`).join(' ');
+          const dots = points.map((p, i) => `<circle cx="${xScale(i)}" cy="${yScale(p.total)}" r="4" fill="#1f77b4"/>`).join('');
+          const labels = points.map((p, i) => `<text x="${xScale(i)}" y="${yScale(p.total) - 8}" text-anchor="middle" font-size="9" fill="#1f77b4">${p.total}</text>`).join('');
+          const series = `<polyline points="${line}" fill="none" stroke="#1f77b4" stroke-width="2.5"/>${dots}${labels}`;
+          const legend = `<rect x="${width - 210}" y="${margin.top + 10}" width="170" height="30" fill="white" stroke="#ccc" rx="4"/><line x1="${width - 198}" y1="${margin.top + 26}" x2="${width - 178}" y2="${margin.top + 26}" stroke="#1f77b4" stroke-width="2.5"/><text x="${width - 170}" y="${margin.top + 30}" font-size="10" fill="#333">Total Bugs (Line)</text>`;
+          svgChart = buildGridAndAxis(yAxisMax, xLabelSvg, `Line-only Bug Trend${trend.queryName ? ` - ${trend.queryName}` : ''}`, series, legend);
+        } else if (effectiveChartType === 'stacked-bar') {
+          const yAxisMax = Math.ceil(Math.max(1, ...points.map((p) => p.total)) * 1.15);
+          const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+          const barW = Math.max(10, Math.min(30, plotW / Math.max(1, n * 2)));
+          const series = points
+            .map((p, i) => {
+              const x = xScale(i) - barW / 2;
+              const other = Math.max(0, p.total - p.active - p.resolved);
+              const yResolved = yScale(p.resolved);
+              const yActive = yScale(p.resolved + p.active);
+              const yOther = yScale(p.total);
+              return [
+                `<rect x="${x}" y="${yResolved}" width="${barW}" height="${Math.max(0, yScale(0) - yResolved)}" fill="#2ca02c"/>`,
+                `<rect x="${x}" y="${yActive}" width="${barW}" height="${Math.max(0, yResolved - yActive)}" fill="#d62728"/>`,
+                `<rect x="${x}" y="${yOther}" width="${barW}" height="${Math.max(0, yActive - yOther)}" fill="#ffbf00"/>`,
+                `<text x="${xScale(i)}" y="${yOther - 6}" text-anchor="middle" font-size="9" fill="#444">${p.total}</text>`,
+                `<text x="${xScale(i)}" y="${margin.top + plotH + 28}" text-anchor="middle" font-size="8" fill="#777">O:${other}</text>`,
+              ].join('');
+            })
+            .join('');
+          const legend = `<rect x="${width - 230}" y="${margin.top + 10}" width="190" height="68" fill="white" stroke="#ccc" rx="4"/><rect x="${width - 218}" y="${margin.top + 16}" width="12" height="12" fill="#2ca02c"/><text x="${width - 200}" y="${margin.top + 26}" font-size="10" fill="#333">Resolved/Closed</text><rect x="${width - 218}" y="${margin.top + 36}" width="12" height="12" fill="#d62728"/><text x="${width - 200}" y="${margin.top + 46}" font-size="10" fill="#333">Active/Open</text><rect x="${width - 218}" y="${margin.top + 56}" width="12" height="12" fill="#ffbf00"/><text x="${width - 200}" y="${margin.top + 66}" font-size="10" fill="#333">Other States</text>`;
+          svgChart = buildGridAndAxis(yAxisMax, xLabelSvg, `Stacked Bug Trend${trend.queryName ? ` - ${trend.queryName}` : ''}`, series, legend);
+        } else if (effectiveChartType === 'cumulative') {
+          let running = 0;
+          const cumulative = points.map((p) => {
+            running += p.total;
+            return running;
+          });
+          const yAxisMax = Math.ceil(Math.max(1, ...cumulative) * 1.15);
+          const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+          const line = cumulative.map((v, i) => `${xScale(i)},${yScale(v)}`).join(' ');
+          const dots = cumulative.map((v, i) => `<circle cx="${xScale(i)}" cy="${yScale(v)}" r="4" fill="#9467bd"/>`).join('');
+          const labels = cumulative.map((v, i) => `<text x="${xScale(i)}" y="${yScale(v) - 8}" text-anchor="middle" font-size="9" fill="#9467bd">${v}</text>`).join('');
+          const series = `<polyline points="${line}" fill="none" stroke="#9467bd" stroke-width="2.8"/>${dots}${labels}`;
+          const legend = `<rect x="${width - 240}" y="${margin.top + 10}" width="200" height="30" fill="white" stroke="#ccc" rx="4"/><line x1="${width - 228}" y1="${margin.top + 26}" x2="${width - 208}" y2="${margin.top + 26}" stroke="#9467bd" stroke-width="2.8"/><text x="${width - 200}" y="${margin.top + 30}" font-size="10" fill="#333">Cumulative Total Bugs</text>`;
+          svgChart = buildGridAndAxis(yAxisMax, xLabelSvg, `Cumulative Bug Trend${trend.queryName ? ` - ${trend.queryName}` : ''}`, series, legend, 'Running Bug Total');
+        } else if (effectiveChartType === 'release-family') {
+          const familyAgg = [
+            { family: 'VA-series', total: 0, resolved: 0 },
+            { family: 'V1.x-series', total: 0, resolved: 0 },
+            { family: 'Other/Untagged', total: 0, resolved: 0 },
+          ];
+          for (const p of points) {
+            if (/^VA/i.test(p.release)) {
+              familyAgg[0].total += p.total;
+              familyAgg[0].resolved += p.resolved;
+            } else if (/^V1\./i.test(p.release)) {
+              familyAgg[1].total += p.total;
+              familyAgg[1].resolved += p.resolved;
+            } else {
+              familyAgg[2].total += p.total;
+              familyAgg[2].resolved += p.resolved;
+            }
+          }
+
+          const yAxisMax = Math.ceil(Math.max(1, ...familyAgg.map((f) => Math.max(f.total, f.resolved))) * 1.2);
+          const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+          const fn = familyAgg.length;
+          const fx = (i: number) => margin.left + (fn === 1 ? plotW / 2 : (i / (fn - 1)) * plotW);
+          const barW = Math.max(18, Math.min(45, plotW / 12));
+          const xLabelsFamily = familyAgg
+            .map((f, i) => `<text x="${fx(i)}" y="${margin.top + plotH + 20}" text-anchor="middle" font-size="10" fill="#333">${xmlEscape(f.family)}</text>`)
+            .join('');
+          const series = familyAgg
+            .map((f, i) => {
+              const cx = fx(i);
+              const x1 = cx - barW - 3;
+              const x2 = cx + 3;
+              const y1 = yScale(f.total);
+              const y2 = yScale(f.resolved);
+              return [
+                `<rect x="${x1}" y="${y1}" width="${barW}" height="${Math.max(0, yScale(0) - y1)}" fill="#1f77b4"/>`,
+                `<rect x="${x2}" y="${y2}" width="${barW}" height="${Math.max(0, yScale(0) - y2)}" fill="#2ca02c"/>`,
+                `<text x="${x1 + barW / 2}" y="${y1 - 6}" text-anchor="middle" font-size="9" fill="#1f77b4">${f.total}</text>`,
+                `<text x="${x2 + barW / 2}" y="${y2 - 6}" text-anchor="middle" font-size="9" fill="#2ca02c">${f.resolved}</text>`,
+              ].join('');
+            })
+            .join('');
+          const legend = `<rect x="${width - 240}" y="${margin.top + 10}" width="200" height="48" fill="white" stroke="#ccc" rx="4"/><rect x="${width - 228}" y="${margin.top + 16}" width="12" height="12" fill="#1f77b4"/><text x="${width - 210}" y="${margin.top + 26}" font-size="10" fill="#333">Total Bugs</text><rect x="${width - 228}" y="${margin.top + 36}" width="12" height="12" fill="#2ca02c"/><text x="${width - 210}" y="${margin.top + 46}" font-size="10" fill="#333">Resolved Bugs</text>`;
+          svgChart = buildGridAndAxis(yAxisMax, xLabelsFamily, `Bug Trend by Release Family${trend.queryName ? ` - ${trend.queryName}` : ''}`, series, legend);
+        } else {
+          const yAxisMax = Math.ceil(Math.max(1, ...points.map((p) => Math.max(p.total, p.resolved))) * 1.15);
+          const yScale = (v: number) => margin.top + plotH - (v / yAxisMax) * plotH;
+
+          let series = '';
+          if (effectiveChartType === 'comparison') {
+            const barW = Math.max(8, Math.min(18, plotW / Math.max(1, n * 3.5)));
+            series = points
+              .map((p, i) => {
+                const cx = xScale(i);
+                const x1 = cx - barW - 2;
+                const x2 = cx + 2;
+                const y1 = yScale(p.total);
+                const y2 = yScale(p.resolved);
+                return [
+                  `<rect x="${x1}" y="${y1}" width="${barW}" height="${Math.max(0, yScale(0) - y1)}" fill="#7f7f7f"/>`,
+                  `<rect x="${x2}" y="${y2}" width="${barW}" height="${Math.max(0, yScale(0) - y2)}" fill="#2ca02c"/>`,
+                ].join('');
+              })
+              .join('');
+            const resolvedLine = points.map((p, i) => `${xScale(i)},${yScale(p.resolved)}`).join(' ');
+            series += `<polyline points="${resolvedLine}" fill="none" stroke="#2ca02c" stroke-width="2" stroke-dasharray="4 3"/>`;
+          } else {
+            const totalLine = points.map((p, i) => `${xScale(i)},${yScale(p.total)}`).join(' ');
+            const activeLine = points.map((p, i) => `${xScale(i)},${yScale(p.active)}`).join(' ');
+            const resolvedLine = points.map((p, i) => `${xScale(i)},${yScale(p.resolved)}`).join(' ');
+            const area = `${xScale(0)},${yScale(0)} ${totalLine} ${xScale(n - 1)},${yScale(0)}`;
+            series = [
+              `<polygon points="${area}" fill="#9ecae1" opacity="0.25"/>`,
+              `<polyline points="${totalLine}" fill="none" stroke="#1f77b4" stroke-width="3"/>`,
+              `<polyline points="${activeLine}" fill="none" stroke="#ff7f0e" stroke-width="2.2"/>`,
+              `<polyline points="${resolvedLine}" fill="none" stroke="#2ca02c" stroke-width="2.2"/>`,
+              ...points.map((p, i) => `<circle cx="${xScale(i)}" cy="${yScale(p.total)}" r="4" fill="#1f77b4"/>`),
+            ].join('');
+          }
+
+          const legend = effectiveChartType === 'comparison'
+            ? `<rect x="${width - 220}" y="${margin.top + 10}" width="180" height="48" fill="white" stroke="#ccc" rx="4"/><rect x="${width - 208}" y="${margin.top + 16}" width="12" height="12" fill="#7f7f7f"/><text x="${width - 190}" y="${margin.top + 26}" font-size="10" fill="#333">Total Bugs</text><rect x="${width - 208}" y="${margin.top + 36}" width="12" height="12" fill="#2ca02c"/><text x="${width - 190}" y="${margin.top + 46}" font-size="10" fill="#333">Resolved/Closed</text>`
+            : `<rect x="${width - 240}" y="${margin.top + 10}" width="200" height="68" fill="white" stroke="#ccc" rx="4"/><line x1="${width - 228}" y1="${margin.top + 18}" x2="${width - 208}" y2="${margin.top + 18}" stroke="#1f77b4" stroke-width="3"/><text x="${width - 200}" y="${margin.top + 22}" font-size="10" fill="#333">Total Bugs</text><line x1="${width - 228}" y1="${margin.top + 38}" x2="${width - 208}" y2="${margin.top + 38}" stroke="#ff7f0e" stroke-width="2.2"/><text x="${width - 200}" y="${margin.top + 42}" font-size="10" fill="#333">Active/Open</text><line x1="${width - 228}" y1="${margin.top + 58}" x2="${width - 208}" y2="${margin.top + 58}" stroke="#2ca02c" stroke-width="2.2"/><text x="${width - 200}" y="${margin.top + 62}" font-size="10" fill="#333">Resolved/Closed</text>`;
+
+          const title = effectiveChartType === 'comparison'
+            ? `Comparison Trend: Bugs vs Resolved${trend.queryName ? ` - ${trend.queryName}` : ''}`
+            : `Regenerated Bug Trend (Styled)${trend.queryName ? ` - ${trend.queryName}` : ''}`;
+          svgChart = buildGridAndAxis(yAxisMax, xLabelSvg, title, series, legend);
+        }
+      }
+
+      // ── CSV Export ──────────────────────────────────────────────────────
+      let csvTempPath: string | undefined;
+      if (includeCsv) {
+        const csvHeader = 'release,iterationPath,total,active,resolved';
+        const csvRows = trend.points.map((p) =>
+          `"${p.release}","${p.iterationPath}",${p.total},${p.active},${p.resolved}`
+        ).join('\n');
+        csvTempPath = path.join(os.tmpdir(), 'bug_trend_data.csv');
+        fs.writeFileSync(csvTempPath, `${csvHeader}\n${csvRows}`, 'utf-8');
+      }
+
+      // ── Build text summary ──────────────────────────────────────────────
+      const nonUntagged = trend.points.filter((p) => p.release !== 'Untagged');
+      const untaggedPoint = trend.points.find((p) => p.release === 'Untagged');
+      const maxCount = trend.points.length > 0 ? Math.max(...trend.points.map((p) => p.total)) : 0;
+
+      const getTrendLabel = (p: { release: string; total: number }): string => {
+        if (p.release === 'Untagged') return '⚪ N/A';
+        if (p.total === maxCount && maxCount > 0) return '🔴 **Peak**';
+        if (p.total >= 20) return '🔴 High';
+        if (p.total >= 10) return '🟡 Medium';
+        return '🟢 Low';
+      };
+
+      const isPeak = (p: { release: string; total: number }) =>
+        p.total === maxCount && p.release !== 'Untagged' && maxCount > 0;
+
+      const tableRows = trend.points
+        .map((p) => {
+          const rel = isPeak(p) ? `**${p.release}**` : p.release;
+          const cnt = isPeak(p) ? `**${p.total}**` : `${p.total}`;
+          return `| ${rel} | ${cnt} | ${getTrendLabel(p)} |`;
+        })
+        .join('\n');
+
+      // Key Insights
+      const sortedByCount = [...nonUntagged].sort((a, b) => b.total - a.total);
+      const [top1, top2, top3] = sortedByCount;
+      const recent = nonUntagged.slice(-3);
+      const recentDecline =
+        recent.length >= 2 && recent[recent.length - 1].total < recent[0].total;
+
+      const keyInsights: string[] = [];
+      if (top1)
+        keyInsights.push(
+          `- 🚨 **Highest bug count: ${top1.release}** with **${top1.total} bugs** — peak release requiring root cause analysis`
+        );
+      if (top2)
+        keyInsights.push(`- 🚨 **Second highest: ${top2.release}** with **${top2.total} bugs**`);
+      if (top3)
+        keyInsights.push(`- 🔥 **${top3.release}** with **${top3.total} bugs**`);
+      if (recentDecline) {
+        const recentNames = recent.map((p) => p.release).join(', ');
+        keyInsights.push(
+          `- ✅ **Improvement trend:** Recent releases (${recentNames}) show reduced bug counts, indicating stabilization`
+        );
+      }
+      if (untaggedPoint)
+        keyInsights.push(
+          `- ⚠️ **${untaggedPoint.total} Untagged bug(s)** — action needed to add release tags for better traceability`
+        );
+
+      // Trend Observations
+      const peaks = nonUntagged.filter((p) => p.total >= 20);
+      const trendObs: string[] = [];
+      if (peaks.length > 0) {
+        const peakList = peaks.map((p) => `**${p.release} (${p.total})**`).join(' and ');
+        trendObs.push(
+          `1. **${peaks.length > 1 ? peaks.length + ' peaks' : 'A peak'}** visible: ${peakList} — these releases may warrant deeper root cause analysis`
+        );
+      }
+      trendObs.push(
+        `${trendObs.length + 1}. **Recovery pattern:** After each peak, subsequent releases show reduced defects, indicating effective bug remediation`
+      );
+      if (recentDecline) {
+        trendObs.push(
+          `${trendObs.length + 1}. **Recent releases** (ending at ${recent[recent.length - 1].release}) demonstrate a **declining trend** — a positive quality signal`
+        );
+      }
+
+      // Recommendations
+      const recoms: string[] = [
+        `- 🔎 Investigate root causes for **${top1?.release || 'peak releases'}** peak(s) (potential retrospective topic)`,
+      ];
+      if (untaggedPoint)
+        recoms.push(
+          `- 🏷️ Tag the **${untaggedPoint.total} Untagged bug(s)** with appropriate release labels`
+        );
+      recoms.push(`- 📊 Continue tracking the trend into upcoming releases`);
+      recoms.push(`- 🧪 Consider strengthening test coverage in areas most frequently affected`);
+
+      const summaryText = [
+        `Retrieved and analyzed **${trend.totalBugs} bug work items** from the query based on release tags.`,
+        shouldRenderChart && selectedChartType
+          ? `**Visualization selected:** ${chartTypeLabelMap[selectedChartType]}`
+          : `**Visualization:** Not generated yet`,
+        '',
+        `#### 📊 Bug Distribution Summary`,
+        '',
+        '| Release | Bug Count | Trend |',
+        '|:--------|----------:|:------|',
+        tableRows,
+        '',
+        `#### 🔍 Key Insights`,
+        '',
+        ...keyInsights,
+        '',
+        `#### 📈 Trend Observations`,
+        '',
+        ...trendObs,
+        '',
+        `#### 💡 Recommendations`,
+        '',
+        ...recoms,
+      ].join('\n');
+
+      // ── Assemble content blocks ─────────────────────────────────────────
+      const contentBlocks: { type: string; text?: string; data?: string; mimeType?: string }[] = [];
+
+      let chartTempPath: string | undefined;
+      if (svgChart) {
+        const pngBuffer = await sharp(Buffer.from(svgChart, 'utf-8')).png().toBuffer();
+        chartTempPath = path.join(os.tmpdir(), 'bug_trend_chart.png');
+        fs.writeFileSync(chartTempPath, pngBuffer);
+      }
+
+      const pathNotes: string[] = [];
+      if (chartTempPath) pathNotes.push(`> **Chart saved to:** \`${chartTempPath}\``);
+      if (csvTempPath)   pathNotes.push(`> **CSV saved to:** \`${csvTempPath}\``);
+
+      const basePrompt = shouldRenderChart
+        ? [
+            'Would you like me to create another trend chart?',
+            '',
+            '1. **📉 Line-only trend chart**',
+            '2. **📊 Stacked bar chart**',
+            '3. **🔀 Comparison chart**',
+            '4. **📈 Cumulative trend**',
+            '5. **🎨 Grouped by release family**',
+            '6. **🔄 Regenerate the same chart**',
+            '',
+            'Reply with a number (1-6) or chart name.',
+          ].join('\n')
+        : [
+            'Would you like me to create a visualization chart for this trend?',
+            '',
+            '1. **📉 Line-only trend chart** — cleaner line chart without bars (pure trend visualization)',
+            '2. **📊 Stacked bar chart** — breakdown by defect category (Active/Resolved/Other) per release',
+            '3. **🔀 Comparison chart** — bugs vs. resolved/closed per release',
+            '4. **📈 Cumulative trend** — running total of bugs across releases',
+            '5. **🎨 Grouped by release family** — VA-series vs. V1.x-series side-by-side',
+            '6. **🔄 Regenerate the same chart** — with different styling (colors, layout, annotations)',
+            '',
+            'Reply with a number (1-6) or chart name.',
+          ].join('\n');
+
+      const textPayload = [summaryText, '', basePrompt, '', ...pathNotes].join('\n');
+      contentBlocks.push({ type: 'text' as const, text: textPayload });
+
+      if (svgChart && chartTempPath) {
+        const pngBuffer = fs.readFileSync(chartTempPath);
+        contentBlocks.push({ type: 'image' as const, data: pngBuffer.toString('base64'), mimeType: 'image/png' });
+      }
+
+      return { content: contentBlocks as any };
+    } catch (error: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error generating bug trend chart: ${error.message}` }],
         isError: true,
       };
     }
